@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "interslice.workspaces",
+  "name": "Workspaces",
+  "version": "1.0.0",
+  "author": "Chris Biagini",
+  "description": "Named workspaces with colorhash pills, a rename dialog, and a per-workspace window menu",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Workspaces.qml"
+  },
+  "barWidget": {
+    "displayName": "Workspaces",
+    "description": "Named workspaces with colorhash pills, a rename dialog, and a per-workspace window menu",
+    "category": "Compositor",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.workspaces"
+  },
+  "license": "MIT"
+}

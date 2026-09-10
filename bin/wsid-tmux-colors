@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# wsid-tmux-colors — stamp colorhash colors into tmux user options.
+#
+#   @wsid_ok      (global)      : "1" once the palette loaded and the stamping below
+#                                 succeeded. statusbar.conf branches its entire
+#                                 wsid-vs-plain choice on this one option, so it is set
+#                                 LAST — a half-stamped bar would render some segments
+#                                 hashed and some fallback.
+#   @wsid_host_color/_text      : the host segment, colorhash of `hostname -s`. BACKGROUND
+#                 (global)        fill plus its WCAG polarity text, the same treatment the
+#                                 session gets. Pins the segment to a hex, so it no longer
+#                                 re-themes with Omarchy; that is the deliberate trade for
+#                                 telling nexus apart from rika at a glance over mosh.
+#   @wsid_color   (per session) : BACKGROUND fill for the session name — colorhash of the
+#                                 session name. ws-attach derives the session from the
+#                                 sanitized workspace label, so session == sanitized label
+#                                 by construction — no daemon syncs them. Bar and pad agree
+#                                 by pure derivation (color = hash(name)), no IPC.
+#   @wsid_text    (per session) : black/white to write ON @wsid_color, by WCAG polarity.
+#                                 NOT decoration: three of the ten Petroff cells (#bd1f01,
+#                                 #832db6, #717581) are dark enough that a hardcoded
+#                                 fg=black was unreadable.
+#   @wsid_wfg     (per WINDOW)  : FOREGROUND for this window's entry in the window list,
+#                                 colorhash of the WINDOW NAME. window-status-format
+#                                 resolves user options at window scope, so one option name
+#                                 serves every entry — no per-index cascade in the format.
+#
+# WHY WINDOWS ARE HASHED AND NOT BINNED (changed 2026-08-22)
+# This replaced @wsid_win1..6, which were fixed per-index bins: window index i got cell
+# i-1. That made a window's color a function of WHERE IT SAT. With renumber-windows on,
+# closing window 1 slid everything left and repainted the whole list — the color actively
+# worked against orientation, which is the one job it has. Hashing the name instead means
+# a window keeps its color for as long as it keeps its name, at any index.
+#
+# The cost, accepted knowingly: at n=10 cells, host + session + three windows collide
+# about 70% of the time, and two adjacent windows can share a color. A collision is not
+# a failure here — color is a recognition aid keyed to a name, not an identity channel,
+# and the name is written right beside it. The alternative (nudging a duplicate off its
+# neighbour's cell) was rejected because it puts position back into the function.
+#
+# The macropad's bottom row is still index-binned and no longer matches the bar. That is
+# a known, deliberate divergence: the pad needs work beyond this change.
+#
+# AUTOMATIC RENAMES ARE THE COMMON CASE. automatic-rename is on with format
+# '#{b:pane_current_path}', so a window's name — and therefore its color — follows its
+# directory and changes on cd. The window-renamed hook in statusbar.conf fires for
+# automatic renames as well as manual ones (verified, tmux 3.7b), which is what keeps the
+# stamp current without polling or a #() fork in the format. That hook path passes
+# `-w <target> -n <name>` so a cd restamps one window rather than every window in every
+# session. The name needs care on that path: for an AUTOMATIC rename both -n and a
+# read-back are one rename stale, so stamp_window derives the name from
+# automatic-rename-format instead. See the comment there.
+#
+# Invoked from statusbar.conf behind an if-shell existence guard; on machines without
+# the wsid lib (thinkpad, rika) the guard fails and the bar keeps its ANSI colors.
+# Sourcing the lib also fails when ~/.config/colorhash/palette.json is absent, which
+# degrades the same way — deliberately, rather than falling back to some other palette.
+# Inside tmux run-shell, $TMUX routes the bare `tmux` calls to the invoking server;
+# WSID_TMUX_CMD overrides for tests ("tmux -L somesocket").
+set -euo pipefail
+
+WSID_LIB="$HOME/.local/lib/workspace-identity-lib"
+[[ -r "$WSID_LIB" ]] || exit 0
+# shellcheck source=/dev/null
+source "$WSID_LIB" || exit 0
+# Sourcing succeeds even without a palette — the lib keeps wsid_session_name usable
+# for ws-attach, which must never die over a missing color file. Colors are the whole
+# job here, so guard explicitly and leave the bar on its ANSI fallback.
+wsid_have_palette || exit 0
+
+read -ra TMUX_CMD <<< "${WSID_TMUX_CMD:-tmux}"
+command -v "${TMUX_CMD[0]}" >/dev/null || exit 0
+
+# -w <target>: stamp exactly this window and nothing else. The window-renamed hook uses
+# it; a bare invocation (startup, attach) stamps everything.
+# -n <name>:   the name to hash, instead of reading it back from the window.
+ONE_WINDOW="" GIVEN_NAME=""
+while getopts ":w:n:" opt; do
+  case "$opt" in
+    w) ONE_WINDOW="$OPTARG" ;;
+    n) GIVEN_NAME="$OPTARG" ;;
+    *) exit 0 ;;
+  esac
+done
+
+# wopt <target> <option> — a window option's EFFECTIVE value.
+# `show-options -w` reports only what is set ON the window; an option set globally with
+# `setw -g` comes back EMPTY there. Both of the options below are normally global, so a
+# lookup without this fallback silently yields "" and every branch keyed on it dies.
+wopt() {
+  local v
+  v="$("${TMUX_CMD[@]}" show-options -wqv -t "$1" "$2" 2>/dev/null)"
+  [[ -n "$v" ]] || v="$("${TMUX_CMD[@]}" show-options -gwqv "$2" 2>/dev/null)"
+  printf '%s' "$v"
+}
+
+# stamp_window <target> [name] — @wsid_wfg + @wsid_wbg/@wsid_wtext from the window's name.
+#
+# WHICH SOURCE IS AUTHORITATIVE DEPENDS ON HOW THE WINDOW GOT ITS NAME. Measured on
+# tmux 3.7b, and the reason this function is not a one-liner:
+#
+#   MANUAL (automatic-rename off). rename-window commits the name and THEN notifies, so
+#   the #{hook_window_name} statusbar.conf passes as -n is the new name. Trust it.
+#
+#   AUTOMATIC (automatic-rename on). window-renamed fires from tmux's periodic name check
+#   BEFORE the name is committed, and the FIRST hook in the array expands its formats at
+#   that moment. So -n arrives holding the PREVIOUS name, and a #{window_name} read from
+#   inside the hook returns the previous name too. Either one lands the stamp a rename
+#   behind: every window wears its last directory's colour after a cd. (A hook APPENDED
+#   after this one does see the new name, which is a trap when instrumenting this — the
+#   logging hook reads correct while the stamping hook reads stale.)
+#
+#   What is already current at that moment is pane_current_path — the cd is what triggered
+#   the rename. So for an auto-named window, expand that window's own
+#   automatic-rename-format: it is precisely the computation tmux is about to perform,
+#   which makes the value right by construction instead of by winning a race.
+#
+# The format is read from the window rather than assumed to be '#{b:pane_current_path}':
+# it is a per-window option and a window may carry its own.
+stamp_window() {
+  local target="$1" name="${2:-}" fmt fg bg text
+  if [[ "$(wopt "$target" automatic-rename)" == "on" ]]; then
+    fmt="$(wopt "$target" automatic-rename-format)"
+    [[ -n "$fmt" ]] && name="$("${TMUX_CMD[@]}" display -p -t "$target" "$fmt" 2>/dev/null)"
+  fi
+  if [[ -z "$name" ]]; then
+    name="$("${TMUX_CMD[@]}" display -p -t "$target" '#{window_name}' 2>/dev/null)" || return 0
+  fi
+  [[ -n "$name" ]] || return 0
+  fg="$(wsid_fg 0 "$name")" || return 0
+  # The current-window pill needs the FILL pair, not the text-on-ground colour:
+  # @sb_curwin_wsid paints @wsid_wbg as the block and @wsid_wtext on it — the same
+  # bg/bgText surfaces the session pill uses, so a session and a window that share a
+  # name render the same pill. (Before 2026-08-22 the pill reversed @wsid_wfg into a
+  # fill: a surface-role swap the palette never vetted, visible as two different
+  # ambers for one name.)
+  bg="$(wsid_color 0 "$name")" || return 0
+  text="$(wsid_text 0 "$name")" || return 0
+  "${TMUX_CMD[@]}" set -w -t "$target" @wsid_wfg "$fg" 2>/dev/null || true
+  "${TMUX_CMD[@]}" set -w -t "$target" @wsid_wbg "$bg" 2>/dev/null || true
+  "${TMUX_CMD[@]}" set -w -t "$target" @wsid_wtext "$text" 2>/dev/null || true
+}
+
+if [[ -n "$ONE_WINDOW" ]]; then
+  stamp_window "$ONE_WINDOW" "$GIVEN_NAME"
+  exit 0
+fi
+
+# --- host: one hash, one pair of globals --------------------------------------------
+# `hostname -s` rather than tmux's #h so the value is stable regardless of which client
+# is attached; #h is the server's host anyway, but reading it here keeps the hash input
+# in one place with the rest of the script.
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || echo unknown)"
+"${TMUX_CMD[@]}" set -g @wsid_host_color "$(wsid_color 0 "$HOSTNAME_SHORT")" 2>/dev/null || exit 0
+"${TMUX_CMD[@]}" set -g @wsid_host_text  "$(wsid_text  0 "$HOSTNAME_SHORT")" 2>/dev/null || exit 0
+
+# --- sessions: the name segment ------------------------------------------------------
+while IFS= read -r s; do
+  [[ -n "$s" ]] || continue
+  # Trailing ":" forces session:window target parsing. Without it, tmux's
+  # options commands (set-option/show-options) fail to resolve a bare
+  # exact-match "=name" session target ("no such session: =name") even
+  # though has-session/rename-session accept the identical bare form --
+  # confirmed on tmux 3.7b. ":" alone (no window index) still resolves to
+  # the session and sets @wsid_color at true session scope, visible from
+  # every window in it (verified: window 0 and window 1 both read it back
+  # identically after a single set).
+  "${TMUX_CMD[@]}" set -t "=$s:" @wsid_color "$(wsid_color 0 "$s")" 2>/dev/null || true
+  "${TMUX_CMD[@]}" set -t "=$s:" @wsid_text  "$(wsid_text  0 "$s")" 2>/dev/null || true
+done < <("${TMUX_CMD[@]}" list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+# --- windows: every window in every session ------------------------------------------
+# list-windows -a emits window IDs (@N), which are stable across renumbering and unique
+# server-wide — unlike "session:index", which the very renumbering this change exists to
+# survive would invalidate mid-loop.
+while IFS= read -r w; do
+  [[ -n "$w" ]] || continue
+  stamp_window "$w"
+done < <("${TMUX_CMD[@]}" list-windows -a -F '#{window_id}' 2>/dev/null || true)
+
+# Set LAST: the sentinel means "every option above is present", so statusbar.conf never
+# renders a partially-stamped bar.
+"${TMUX_CMD[@]}" set -g @wsid_ok 1 2>/dev/null || true

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# ws-rename-workspace <session> [--dry-run]
+#   Mirror a tmux session rename onto the Hyprland workspace that session lives on.
+#
+# Wired to tmux's `session-renamed` hook in ~/.config/tmux/statusbar.conf. Hooking the
+# EVENT rather than patching ~/.local/bin/tmux-rename is deliberate: the hook fires for
+# every rename path -- prefix-$, the rename popup, a bare `tmux rename-session` from a
+# script, and a rename issued from a phone over mosh -- so there is exactly one place
+# this behaviour can come from.
+#
+# tmux-local-clients owns the process-ancestry lookup. It maps any local client for
+# the renamed session to its Hyprland window, independent of terminal class or app-id.
+# Remote-only sessions therefore remain clean no-ops.
+#
+# EVERY FAILURE IS A SILENT NO-OP, exit 0. This runs from a hook on every rename; a
+# script that can make renaming fail or print noise into a popup is worse than one that
+# occasionally declines to do anything. `--dry-run` prints what it would do instead.
+set -uo pipefail
+
+dry=0
+args=()
+for a in "$@"; do
+	case $a in
+		--dry-run) dry=1 ;;
+		*) args+=("$a") ;;
+	esac
+done
+session="${args[0]:-}"
+[[ -n $session ]] || exit 0
+
+say() { [[ $dry -eq 1 ]] && printf '%s\n' "$*"; return 0; }
+
+# --- name guards -------------------------------------------------------------------
+# A bare-digit name is refused because Hyprland addresses workspaces by numeric id AND
+# by name: naming workspace 3 "5" makes `hyprctl dispatch workspace 5` ambiguous to a
+# reader even where it is not ambiguous to the compositor. Not worth the confusion.
+if [[ $session =~ ^[0-9]+$ ]]; then
+	say "refuse: '$session' is a bare number (would shadow a workspace id)"
+	exit 0
+fi
+# "special:" is Hyprland's scratchpad namespace; renaming a normal workspace into it
+# would move it out of the normal switching set.
+if [[ $session == special:* ]]; then
+	say "refuse: '$session' is in the special: namespace"
+	exit 0
+fi
+
+command -v hyprctl >/dev/null 2>&1 || exit 0   # not a Hyprland box (rika): no-op
+command -v jq >/dev/null 2>&1 || exit 0
+
+# --- find the session's local terminal window --------------------------------------
+if ! associations="$(tmux-local-clients 2>/dev/null)"; then
+	say "skip: local tmux association resolution failed"
+	exit 0
+fi
+
+wsid="$(jq -r --arg s "$session" '
+  map(select(.session == $s))
+  | if length == 0 then "" else min_by([.focusHistoryID, .address]).workspace.id end
+' <<<"$associations" 2>/dev/null)" || {
+	say "skip: invalid local tmux association data"
+	exit 0
+}
+
+if [[ -z $wsid ]]; then
+	say "no local terminal for session '$session' (remote-only, or window closed)"
+	exit 0
+fi
+
+# --- workspace guards ---------------------------------------------------------------
+ws_json="$(hyprctl workspaces -j 2>/dev/null)" || exit 0
+
+current="$(jq -r --argjson id "$wsid" 'first(.[] | select(.id == $id)) | .name // empty' <<<"$ws_json")"
+if [[ $current == "$session" ]]; then
+	say "no-op: workspace $wsid is already named '$session'"
+	exit 0
+fi
+
+# Two workspaces sharing a name is the one genuinely harmful outcome: ws-attach derives
+# its session name FROM the workspace name, so duplicates make two workspaces fight
+# over a single tmux session. Decline rather than create that state.
+clash="$(jq -r --arg n "$session" --argjson id "$wsid" '.[] | select(.name == $n and .id != $id) | .id' <<<"$ws_json" | head -1)"
+if [[ -n $clash ]]; then
+	say "refuse: workspace $clash is already named '$session'"
+	exit 0
+fi
+
+# --- do it ---------------------------------------------------------------------------
+if [[ $dry -eq 1 ]]; then
+	say "would rename workspace $wsid ('$current') -> '$session'"
+	exit 0
+fi
+# Provider-aware rename (mirror of workspace-identity-lib's wsid_rename_workspace;
+# kept inline because this script is fleet-shared and deliberately lib-free). Quattro's
+# Lua config provider rejects the classic `dispatch renameworkspace <id> <name>`.
+rename_workspace() {
+	local id="$1" name="$2" esc
+	if hyprctl systeminfo 2>/dev/null | grep -q 'configProvider: lua'; then
+		esc=${name//\\/\\\\}; esc=${esc//\"/\\\"}
+		hyprctl dispatch "hl.dsp.workspace.rename({workspace = $id, name = \"$esc\"})" >/dev/null 2>&1 || true
+	else
+		hyprctl dispatch renameworkspace "$id" "$name" >/dev/null 2>&1 || true
+	fi
+}
+rename_workspace "$wsid" "$session"
+exit 0

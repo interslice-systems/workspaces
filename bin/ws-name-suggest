@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# ws-name-suggest — print a candidate task-space name for the active workspace,
+# or nothing. Used by the Quickshell rename dialog (interslice.workspaces) to prefill
+# its text field: the git repo containing the focused pane's cwd is nearly
+# always the name you were about to type.
+#
+# Resolution: active workspace -> its tmux session (lowest-focusHistoryID local
+# client, same rule as ws-rename) -> that session's active pane cwd -> git
+# toplevel basename. Any missing link exits 0 silently; a prefill is a
+# convenience, never an error.
+set -uo pipefail
+
+aw_id="$(hyprctl activeworkspace -j 2>/dev/null | jq -er '.id')" || exit 0
+session="$(tmux-local-clients 2>/dev/null | jq -er --argjson id "$aw_id" '
+  map(select(.workspace.id == $id))
+  | if length == 0 then empty else min_by([.focusHistoryID, .address]).session end
+')" || exit 0
+path="$(tmux display-message -p -t "=$session:" '#{pane_current_path}' 2>/dev/null)" || exit 0
+[[ -d "$path" ]] || exit 0
+top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || exit 0
+basename "$top"

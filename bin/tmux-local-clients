@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -uo pipefail
+export LC_ALL=C.UTF-8
+
+proc_root="${TMUX_LOCAL_CLIENTS_PROC_ROOT:-/proc}"
+tmp="$(mktemp -d)" || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+die() {
+  printf 'tmux-local-clients: %s\n' "$*" >&2
+  exit 1
+}
+
+ppid_of() {
+  local stat ppid
+  (( $1 > 1 )) || return 1
+  stat="$(< "$proc_root/$1/stat")" 2>/dev/null || return 1
+  stat="${stat##*') '}"
+  # shellcheck disable=SC2086
+  set -- $stat
+  ppid="${2:-}"
+  [[ $ppid =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$ppid"
+}
+
+if ! tmux list-clients -F $'#{session_name}\t#{client_pid}\t#{client_activity}' \
+  > "$tmp/tmux.out" 2> "$tmp/tmux.err"
+then
+  tmux_error="$(< "$tmp/tmux.err")"
+  if [[ $tmux_error == *'no server running on'* ]] ||
+    [[ $tmux_error == *'error connecting to'* && $tmux_error == *'No such file or directory'* ]]
+  then
+    printf '[]\n'
+    exit 0
+  fi
+  die "tmux list-clients failed: $tmux_error"
+fi
+
+if ! hyprctl clients -j > "$tmp/hypr.json" 2> "$tmp/hypr.err"; then
+  die "hyprctl clients failed: $(< "$tmp/hypr.err")"
+fi
+if ! jq -e 'type == "array"' "$tmp/hypr.json" >/dev/null 2>&1; then
+  die 'invalid hyprctl clients JSON'
+fi
+
+declare -A window_by_pid=()
+while IFS=$'\t' read -r pid record; do
+  window_by_pid["$pid"]="$record"
+done < <(jq -r '
+  .[]
+  | select((.pid | type) == "number" and .pid > 0 and (.pid | floor) == .pid)
+  | select((.address | type) == "string" and (.address | length) > 0)
+  | select((.workspace | type) == "object")
+  | select((.workspace.id | type) == "number" and (.workspace.id | floor) == .workspace.id)
+  | select((.workspace.name | type) == "string")
+  | select((.class | type) == "string")
+  | select((.focusHistoryID | type) == "number" and .focusHistoryID >= 0 and (.focusHistoryID | floor) == .focusHistoryID)
+  | [.pid, ({address, pid, workspace:{id:.workspace.id,name:.workspace.name}, class, focusHistoryID} | @base64)]
+  | @tsv
+' "$tmp/hypr.json")
+
+: > "$tmp/records.jsonl"
+while IFS=$'\t' read -r session client_pid activity; do
+  [[ -n $session ]] || continue
+  [[ $client_pid =~ ^[0-9]+$ ]] || continue
+  [[ $activity =~ ^[0-9]+$ ]] || continue
+
+  pid="$client_pid"
+  for ((depth = 0; depth < 8; depth++)); do
+    pid="$(ppid_of "$pid")" || break
+    if [[ -n ${window_by_pid[$pid]+x} ]]; then
+      record="$(base64 --decode <<< "${window_by_pid[$pid]}")" || break
+      jq -c --arg session "$session" --argjson activity "$activity" \
+        '{session:$session, activity:$activity} + .' \
+        <<< "$record" >> "$tmp/records.jsonl"
+      break
+    fi
+  done
+done < "$tmp/tmux.out"
+
+jq -Rsc '
+  split("\n")
+  | map(select(length > 0))
+  | map(fromjson)
+  | group_by(.address)
+  | map(select((map(.session) | unique | length) == 1)
+        | (min_by(.focusHistoryID) + {activity: (map(.activity) | max)}))
+  | sort_by(.session, .focusHistoryID, .address)
+' "$tmp/records.jsonl"

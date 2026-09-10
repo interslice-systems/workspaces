@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for the workspace URL router.
+set -uo pipefail
+
+# This suite is meant to run from inside tmux (Chris always does). Strip any
+# ambient TMUX_PANE/TMUX here, once, so a plain run() call exercises the
+# window (process-ancestry) path as intended; a per-test `TMUX_PANE='%1' ...
+# run ...` prefix still sets it for that one call, since bash's function-call
+# prefix assignment is scoped to just that invocation and reverts afterward.
+unset TMUX_PANE TMUX
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_OPEN="${WS_OPEN:-$here/../bin/ws-open}"
+WS_BROWSER="${WS_BROWSER:-$HOME/.local/bin/ws-browser}"
+export WS_BROWSER_LIB="${WS_BROWSER_LIB:-$HOME/.local/lib/ws-browser-lib.bash}"
+fails=0
+
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ $actual == "$expected" ]]; then
+    printf 'ok   - %s\n' "$name"
+  else
+    printf 'FAIL - %s\n' "$name"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$expected" "$actual"
+    fails=$((fails + 1))
+  fi
+}
+
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+mkdir -p "$TMPD/bin"
+
+# --- stubs ------------------------------------------------------------------
+cat > "$TMPD/bin/hyprctl" <<'STUB'
+#!/usr/bin/env bash
+default_active='{"id":2,"name":"oracle"}'
+default_workspaces='[{"id":2,"name":"oracle"}]'
+default_clients='[]'
+case "$*" in
+  "activeworkspace -j") printf '%s' "${STUB_ACTIVE:-$default_active}" ;;
+  "workspaces -j")      printf '%s' "${STUB_WORKSPACES:-$default_workspaces}" ;;
+  "clients -j")
+    # Supports a two-call sequence (initial read_toplevel, then the
+    # pre-dispatch recheck) so a test can simulate the workspace changing
+    # underneath ws-open between the two reads. STUB_CLIENTS_2 unset means
+    # both calls see the same value, matching every earlier test's behaviour.
+    n=1
+    if [[ -n ${STUB_CLIENTS_SEQ_FILE:-} ]]; then
+      n=$(( $(cat "$STUB_CLIENTS_SEQ_FILE" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$STUB_CLIENTS_SEQ_FILE"
+    fi
+    if (( n >= 2 )) && [[ -n ${STUB_CLIENTS_2:-} ]]; then
+      printf '%s' "$STUB_CLIENTS_2"
+    else
+      printf '%s' "${STUB_CLIENTS:-$default_clients}"
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+STUB
+
+cat > "$TMPD/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  "display-message -p -t "*" #{session_name}")
+    printf '%s\n' "${STUB_SESSION:-oracle}" ;;
+  "list-clients -F #{session_name}"$'\t'"#{client_activity}")
+    printf '%b' "${STUB_TMUX_CLIENTS:-}" ;;
+  *) exit 1 ;;
+esac
+STUB
+
+cat > "$TMPD/bin/tmux-local-clients" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${STUB_LOCAL:-[]}"
+STUB
+
+cat > "$TMPD/bin/firefox-record" <<'STUB'
+#!/usr/bin/env bash
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  printf 'Firefox help: MOZ_LOG\n'
+  exit 0
+fi
+if (( $# )); then printf '<%s>' "$@" >> "$FF_ARGV_LOG"; fi
+printf '\n' >> "$FF_ARGV_LOG"
+printf '%s\n' "$*" >> "$FF_LOG"
+exit "${STUB_FIREFOX_EXIT:-0}"
+STUB
+
+cat > "$TMPD/bin/omarchy-firefox-bridge" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BRIDGE_LOG"
+printf '%s' "${STUB_BRIDGE_RESULT:-}"
+printf '%s' "${STUB_BRIDGE_STDERR:-}" >&2
+exit "${STUB_BRIDGE_EXIT:-0}"
+STUB
+
+cat > "$TMPD/bin/logger" <<'STUB'
+#!/usr/bin/env bash
+if [[ ${STUB_LOGGER_HANG:-0} == 1 ]]; then sleep 5; fi
+printf '%s\n' "$*" >> "$DIAG_LOG"
+exit "${STUB_LOGGER_EXIT:-0}"
+STUB
+
+# Intercept only process launch and focus. Execute the actual installed Omarchy
+# launcher against a temporary desktop entry, without contacting the desktop.
+cat > "$TMPD/bin/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+while (( $# )) && [[ $1 != uwsm-app ]]; do shift; done
+[[ ${1:-} == uwsm-app && ${2:-} == -- ]] || exit 99
+shift 2
+printf '<%s>' "$@" >> "$LAUNCH_LOG"
+printf '\n' >> "$LAUNCH_LOG"
+exec "$@"
+STUB
+cat > "$TMPD/bin/xdg-settings" <<'STUB'
+#!/usr/bin/env bash
+printf 'ws-open.desktop\n'
+STUB
+cat > "$TMPD/bin/omarchy-hyprland-focus-app" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+
+chmod +x "$TMPD/bin"/*
+
+# Chezmoi's executable_ prefix controls deployed permissions; source files may
+# themselves be 0644. The adapter execs the router, so test an executable copy.
+cp "$WS_OPEN" "$TMPD/bin/ws-open-under-test"
+chmod +x "$TMPD/bin/ws-open-under-test"
+
+# Fixture HOME for the group-colour POSITIVE path: a real copy of this
+# branch's workspace-identity-lib plus a synthetic-but-complete 10-cell
+# palette (matching WSID_FF_COLOR's length, so the real FNV-1a hash of
+# "oracle" lands on the same cell it would against the real palette on this
+# box — verified to resolve to "yellow"). Kept out of the default $TMPD/home
+# (which stays absent) so every other test keeps seeing colour-omitted
+# behaviour; a test opts in with WS_TEST_HOME.
+FIXTURE_HOME="$TMPD/home_colorhash"
+mkdir -p "$FIXTURE_HOME/.local/lib" "$FIXTURE_HOME/.config/colorhash"
+cp "$here/../lib/workspace-identity-lib" \
+  "$FIXTURE_HOME/.local/lib/workspace-identity-lib"
+cat > "$FIXTURE_HOME/.config/colorhash/palette.json" <<'JSON'
+{"cells":[
+{"bg":"#000000","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000001","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000002","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000003","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000004","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000005","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000006","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000007","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000008","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"},
+{"bg":"#000009","bgText":"#ffffff","lightFg":"#000000","darkFg":"#ffffff","led":"#000000"}
+]}
+JSON
+
+run() {
+  : > "$TMPD/ff.log"; : > "$TMPD/bridge.log"
+  : > "$TMPD/diag.log"; : > "$TMPD/ff-argv.log"; : > "$TMPD/launch.log"
+  printf '0' > "$TMPD/clients_seq"
+  # -u strips any TMUX_PANE/TMUX this process inherited; the explicit
+  # TMUX_PANE=/TMUX= right after re-adds them ONLY when a test set them via a
+  # prefix on this specific call (an explicit later assignment on the same
+  # env invocation overrides an earlier -u) — so ambient tmux state can never
+  # leak into a test that didn't ask for the tmux path.
+  env -u TMUX_PANE -u TMUX \
+  ${TMUX_PANE:+TMUX_PANE="$TMUX_PANE"} ${TMUX:+TMUX="$TMUX"} \
+  PATH="$TMPD/bin:/usr/bin:/bin" \
+  FF_LOG="$TMPD/ff.log" BRIDGE_LOG="$TMPD/bridge.log" \
+  FF_ARGV_LOG="$TMPD/ff-argv.log" DIAG_LOG="$TMPD/diag.log" LAUNCH_LOG="$TMPD/launch.log" \
+  WS_OPEN_FIREFOX="$TMPD/bin/firefox-record" \
+  WS_OPEN_ROUTER="$TMPD/bin/ws-open-under-test" \
+  STUB_CLIENTS_SEQ_FILE="$TMPD/clients_seq" \
+  HOME="${WS_TEST_HOME:-$TMPD/home}" \
+    bash "${WS_TEST_ENTRY:-$WS_OPEN}" "$@" >/dev/null 2>&1
+  printf '%s' "$?"
+}
+bridged() { tr -d '\n' < "$TMPD/bridge.log"; }
+launched() { tr -d '\n' < "$TMPD/ff.log"; }
+events() { sed -n 's/.* event=//p' "$TMPD/diag.log" | paste -sd,; }
+run_browser() { WS_TEST_ENTRY="$WS_BROWSER" run "$@"; }
+
+ONE_FF='[{"address":"0xaa","class":"firefox","title":"Alpha — Mozilla Firefox","workspace":{"id":2,"name":"oracle"}}]'
+TWO_FF='[{"address":"0xaa","class":"firefox","title":"A — Mozilla Firefox","workspace":{"id":2,"name":"oracle"}},{"address":"0xbb","class":"firefox","title":"B — Mozilla Firefox","workspace":{"id":2,"name":"oracle"}}]'
+
+# --- URL validation ---------------------------------------------------------
+assert_eq "refuses a non-http scheme" "64" "$(run 'file:///etc/passwd')"
+assert_eq "refuses a leading-hyphen operand" "64" "$(run '-P')"
+assert_eq "refuses zero operands" "64" "$(run)"
+assert_eq "refuses two operands" "64" "$(run https://a.com/ https://b.com/)"
+run 'javascript:alert(1)' >/dev/null
+assert_eq "a refused URL never reaches Firefox" "" "$(launched)"
+assert_eq "a refused URL never reaches the bridge" "" "$(bridged)"
+
+assert_eq "refuses an embedded newline" "64" "$(run $'https://e.com/x\ny')"
+
+STUB_CLIENTS="$ONE_FF" run 'HTTPS://Example.com/' >/dev/null
+assert_eq "accepts an uppercase scheme" "0" \
+  "$(STUB_CLIENTS="$ONE_FF" run 'HTTPS://Example.com/')"
+
+# --- routing ----------------------------------------------------------------
+# The window path walks the REAL /proc ancestry of ws-open: under run() that
+# chain is bash ws-open <- env <- a $(...) subshell <- this test script. So a
+# tmux-local-clients record carrying this script's own pid is "the terminal
+# window this URL was clicked in", and the walk itself is under test, not a
+# stub of it. Every non-tmux test below rides on this default.
+LOCAL_WINDOW='[{"session":"oracle","address":"0xaa","pid":'"$$"',"workspace":{"id":2,"name":"oracle"},"activity":500}]'
+export STUB_LOCAL="$LOCAL_WINDOW"
+export STUB_CLIENTS="$ONE_FF"
+run https://e.com/x >/dev/null
+assert_eq "routes with the toplevel title and workspace group" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+assert_eq "a routed URL does not also launch Firefox" "" "$(launched)"
+
+WS_TEST_HOME="$FIXTURE_HOME" run https://e.com/x >/dev/null
+assert_eq "routes with a colour when colorhash is available" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle --color yellow" \
+  "$(bridged)"
+
+STUB_BRIDGE_EXIT=3 run https://e.com/x >/dev/null
+assert_eq "a bridge failure falls through to Firefox" "https://e.com/x" "$(launched)"
+
+STUB_CLIENTS="$TWO_FF" run https://e.com/x >/dev/null
+assert_eq "two Firefox windows fall through" "https://e.com/x" "$(launched)"
+assert_eq "two Firefox windows never reach the bridge" "" "$(bridged)"
+
+STUB_CLIENTS='[]' run https://e.com/x >/dev/null
+assert_eq "no Firefox on the ACTIVE target opens a new window" \
+  "--new-window https://e.com/x" "$(launched)"
+
+LOCAL_OTHER='[{"session":"oracle","address":"0xcc","workspace":{"id":3,"name":"other"},"activity":500}]'
+STUB_CLIENTS='[]' STUB_WORKSPACES='[{"id":2,"name":"oracle"},{"id":3,"name":"other"}]' \
+  TMUX_PANE='%1' STUB_LOCAL="$LOCAL_OTHER" STUB_TMUX_CLIENTS='oracle\t500\n' \
+  run https://e.com/x >/dev/null
+assert_eq "no Firefox on an INACTIVE target falls through" \
+  "https://e.com/x" "$(launched)"
+
+STUB_LOCAL='[{"session":"oracle","address":"0xaa","pid":'"$$"',"workspace":{"id":-98,"name":"special:scratchpad"},"activity":500}]' \
+  run https://e.com/x >/dev/null
+assert_eq "a special workspace falls through" "https://e.com/x" "$(launched)"
+
+# --- window (process-ancestry) resolution -----------------------------------
+# No TMUX_PANE: the URL came from a terminal's own click-to-open launcher, or
+# from something that is not a terminal at all. Only an ancestor that is a
+# window hosting a local tmux client routes; everything else is the default.
+STUB_LOCAL='[]' run https://e.com/x >/dev/null
+assert_eq "no tmux session anywhere falls through" "https://e.com/x" "$(launched)"
+assert_eq "... with a no-session diagnostic" \
+  route-origin-window,fallback-no-session "$(events)"
+
+STUB_LOCAL='[{"session":"oracle","address":"0xaa","pid":4000000000,"workspace":{"id":2,"name":"oracle"},"activity":500}]' \
+  run https://e.com/x >/dev/null
+assert_eq "a session in some OTHER window falls through" "https://e.com/x" "$(launched)"
+assert_eq "... never reaching the bridge" "" "$(bridged)"
+
+STUB_LOCAL='[{"session":"oracle","address":"0xaa","pid":'"$$"',"workspace":{"id":2,"name":"oracle"},"activity":500},{"session":"other","address":"0xbb","pid":'"$PPID"',"workspace":{"id":3,"name":"other"},"activity":500}]' \
+  run https://e.com/x >/dev/null
+assert_eq "two ancestor windows with different sessions fall through" \
+  "https://e.com/x" "$(launched)"
+
+STUB_LOCAL='[{"session":"oracle","address":"0xaa","pid":'"$$"',"workspace":{"id":2,"name":"renamed"},"activity":500}]' \
+  run https://e.com/x >/dev/null
+assert_eq "the group is named after the SESSION, not the workspace" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+
+# A click is its own evidence of presence. A phone that typed more recently
+# must not veto a URL picked in the local terminal's URL mode, which never
+# reaches tmux as input and so never advances the local client's activity.
+STUB_TMUX_CLIENTS='oracle\t500\noracle\t900\n' run https://e.com/x >/dev/null
+assert_eq "the window path ignores client activity" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+
+# --- pre-dispatch TOCTOU recheck --------------------------------------------
+# hyprctl's "clients -j" stub answers its FIRST call (read_toplevel) with
+# STUB_CLIENTS and every call after with STUB_CLIENTS_2 (see the stub above),
+# simulating Hyprland state changing between ws-open's inspection and its
+# dispatch. A real bridge send would be a genuine misroute here, so this must
+# fall through, not route.
+MOVED_FF='[{"address":"0xaa","class":"firefox","title":"Alpha — Mozilla Firefox","workspace":{"id":3,"name":"other"}}]'
+STUB_CLIENTS="$ONE_FF" STUB_CLIENTS_2="$MOVED_FF" run https://e.com/x >/dev/null
+assert_eq "the toplevel moving off the workspace before dispatch falls through" \
+  "https://e.com/x" "$(launched)"
+assert_eq "... and never reaches the bridge" "" "$(bridged)"
+
+STUB_CLIENTS="$ONE_FF" STUB_CLIENTS_2="$TWO_FF" run https://e.com/x >/dev/null
+assert_eq "a second window appearing before dispatch falls through" \
+  "https://e.com/x" "$(launched)"
+
+# --- tmux resolution --------------------------------------------------------
+LOCAL_ONE='[{"session":"oracle","address":"0xaa","workspace":{"id":2,"name":"oracle"},"activity":500}]'
+LOCAL_TWO='[{"session":"oracle","address":"0xaa","workspace":{"id":2,"name":"oracle"},"activity":500},{"session":"oracle","address":"0xbb","workspace":{"id":3,"name":"other"},"activity":400}]'
+
+export STUB_CLIENTS="$ONE_FF"
+TMUX_PANE='%1' STUB_LOCAL="$LOCAL_ONE" STUB_TMUX_CLIENTS='oracle\t500\n' \
+  run https://e.com/x >/dev/null
+assert_eq "a local tmux session routes to its workspace" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+
+TMUX_PANE='%1' STUB_LOCAL='[]' STUB_TMUX_CLIENTS='oracle\t500\n' \
+  run https://e.com/x >/dev/null
+assert_eq "a remote-only session falls through" "https://e.com/x" "$(launched)"
+
+TMUX_PANE='%1' STUB_LOCAL="$LOCAL_ONE" STUB_TMUX_CLIENTS='oracle\t500\noracle\t900\n' \
+  run https://e.com/x >/dev/null
+assert_eq "a fresher REMOTE client falls through" "https://e.com/x" "$(launched)"
+
+# A tie ROUTES, deliberately (>=, not >) — see the spec amendment. With one
+# local client and no remote, local_activity == overall_activity always, so a
+# strict > would fall through on the ordinary single-client case; and
+# tmux-local-clients dedupes by address, so this exact input is what "one
+# local plus one remote tied at the same second" and "a single local client"
+# both look like by the time ws-open sees them. There is no way to tell them
+# apart, and the spec settles it as: route.
+TMUX_PANE='%1' STUB_LOCAL="$LOCAL_ONE" STUB_TMUX_CLIENTS='oracle\t500\noracle\t500\n' \
+  run https://e.com/x >/dev/null
+assert_eq "a tie between local and remote activity routes" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+
+TMUX_PANE='%1' STUB_LOCAL="$LOCAL_TWO" STUB_TMUX_CLIENTS='oracle\t500\n' \
+  run https://e.com/x >/dev/null
+assert_eq "local clients on two workspaces fall through" "https://e.com/x" "$(launched)"
+
+# --- over-long workspace name degrades to an ungrouped tab -------------------
+# The bridge bounds group.title at 64 code points and rejects the WHOLE
+# request when it is longer, so a naive group_args would silently kill
+# routing for this workspace forever. ws-open must drop --group (and the
+# --color that depends on it) instead, so the URL still routes.
+LONG_NAME="$(printf 'a%.0s' $(seq 1 65))"
+LONG_FF="[{\"address\":\"0xaa\",\"class\":\"firefox\",\"title\":\"Alpha — Mozilla Firefox\",\"workspace\":{\"id\":2,\"name\":\"$LONG_NAME\"}}]"
+STUB_LOCAL="[{\"session\":\"$LONG_NAME\",\"address\":\"0xaa\",\"pid\":$$,\"workspace\":{\"id\":2,\"name\":\"$LONG_NAME\"},\"activity\":500}]" \
+  STUB_CLIENTS="$LONG_FF" \
+  run https://e.com/x >/dev/null
+assert_eq "a session name over 64 code points still routes, ungrouped" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x" \
+  "$(bridged)"
+
+# --- browser adapter and Omarchy launcher integration -----------------------
+assert_eq "adapter launches Firefox without a URL" 0 "$(run_browser)"
+assert_eq "normal launch diagnostic" adapter-normal-launch "$(events)"
+assert_eq "normal launch reaches Firefox with zero arguments" '' "$(tr -d '\n' < "$TMPD/ff-argv.log")"
+assert_eq "normal launch never reaches bridge" '' "$(bridged)"
+for private_flag in --private --private-window --incognito; do
+  assert_eq "adapter accepts $private_flag" 0 "$(run_browser "$private_flag")"
+  assert_eq "private launch uses Firefox flag" --private-window "$(launched)"
+  assert_eq "private launch diagnostic" adapter-private-launch "$(events)"
+  assert_eq "private launch never reaches bridge" '' "$(bridged)"
+done
+run_browser --private-window 'https://example.test/private?a=b&c=d' >/dev/null
+assert_eq "private URL kept in its own argv operand" \
+  '<--private-window><https://example.test/private?a=b&c=d>' "$(tr -d '\n' < "$TMPD/ff-argv.log")"
+assert_eq "private URL never reaches bridge" '' "$(bridged)"
+assert_eq "private URL not logged" adapter-private-launch "$(events)"
+run_browser --new-window https://example.test/ >/dev/null
+assert_eq "explicit new window bypasses routing" '--new-window https://example.test/' "$(launched)"
+assert_eq "help probe succeeds" 0 "$(run_browser --help)"
+assert_eq "help probe does not log" '' "$(events)"
+assert_eq "version probe succeeds" 0 "$(run_browser --version)"
+assert_eq "version probe does not log" '' "$(events)"
+for bad_arg in --profile file:///private-data 'https://example.test/newline
+secret'; do
+  assert_eq "adapter rejects invalid input" 64 "$(run_browser "$bad_arg")"
+  assert_eq "invalid invocation logged without arguments" adapter-invalid-invocation "$(events)"
+  assert_eq "invalid invocation never reaches Firefox" '' "$(launched)"
+done
+assert_eq "private control flag cannot become a URL" 64 "$(run_browser --private-window --profile)"
+assert_eq "multiple URLs rejected" 64 "$(run_browser https://a.test https://b.test)"
+run_browser 'https://user:secret@example.test/a?token=secret#secret' >/dev/null
+assert_eq "adapter routes ordinary URLs" '' "$(launched)"
+assert_eq "route diagnostics are fixed codes" \
+  adapter-route,route-origin-window,group-color-unavailable,route-opened-group-requested "$(events)"
+
+mkdir -p "$TMPD/omarchy-home/.local/share/applications"
+printf '[Desktop Entry]\nType=Application\nExec=%s %%u\n' "$WS_BROWSER" \
+  > "$TMPD/omarchy-home/.local/share/applications/ws-open.desktop"
+run_omarchy() {
+  WS_TEST_ENTRY=/usr/share/omarchy/bin/omarchy-launch-browser \
+    WS_TEST_HOME="$TMPD/omarchy-home" run "$@"
+}
+assert_eq "stock Omarchy normal launch succeeds" 0 "$(run_omarchy)"
+assert_eq "stock Omarchy normal launch reaches adapter" adapter-normal-launch "$(events)"
+assert_eq "stock Omarchy private launch succeeds" 0 "$(run_omarchy --private)"
+assert_eq "Omarchy recognizes Firefox through help probe" \
+  "<$WS_BROWSER><--private-window>" "$(tr -d '\n' < "$TMPD/launch.log")"
+assert_eq "stock Omarchy private launch reaches Firefox" --private-window "$(launched)"
+assert_eq "stock Omarchy private URL stays private" 0 "$(run_omarchy --private https://example.test/private)"
+assert_eq "stock Omarchy private URL never reaches bridge" '' "$(bridged)"
+
+# --- diagnostic privacy and failure behavior --------------------------------
+for bridge_error in unavailable timeout no-window ambiguous-window invalid-request create-failed; do
+  STUB_BRIDGE_EXIT=3 STUB_BRIDGE_RESULT="{\"ok\":false,\"error\":\"$bridge_error\"}" \
+    run https://secret.test/ >/dev/null
+  assert_eq "specific bridge failure logged: $bridge_error" \
+    "route-origin-window,group-color-unavailable,fallback-bridge-$bridge_error" "$(events)"
+done
+STUB_BRIDGE_EXIT=3 STUB_BRIDGE_RESULT='{"error":"https://SECRET.test/?token=SECRET"}' \
+  STUB_BRIDGE_STDERR='SECRET: raw stderr https://SECRET.test/' \
+  run https://SECRET.test/ >/dev/null
+assert_eq "untrusted bridge error reduced to fixed code" \
+  route-origin-window,group-color-unavailable,fallback-bridge-error "$(events)"
+assert_eq "no raw URL or bridge output in logger arguments" 1 "$(rg -q SECRET "$TMPD/diag.log"; printf '%s' "$?")"
+STUB_BRIDGE_EXIT=3 STUB_BRIDGE_RESULT='not JSON: SECRET' run https://SECRET.test/ >/dev/null
+assert_eq "malformed bridge response not logged" \
+  route-origin-window,group-color-unavailable,fallback-bridge-error "$(events)"
+STUB_CLIENTS="$TWO_FF" run https://example.test/ >/dev/null
+assert_eq "ambiguous workspace has a diagnostic" route-origin-window,fallback-multiple-windows "$(events)"
+assert_eq "logging failure cannot prevent opening" 0 "$(STUB_LOGGER_EXIT=1 run_browser)"
+log_started=$SECONDS
+assert_eq "stalled logging cannot prevent opening" 0 "$(STUB_LOGGER_HANG=1 run_browser)"
+assert_eq "stalled logger is stopped within two seconds" 0 "$(( SECONDS - log_started > 2 ))"
+assert_eq "Firefox failure status preserved" 17 "$(STUB_FIREFOX_EXIT=17 run_browser --private-window)"
+
+: > "$TMPD/diag.log"
+PATH="$TMPD/bin:/usr/bin:/bin" DIAG_LOG="$TMPD/diag.log" bash -c \
+  'source "$WS_BROWSER_LIB"; ws_browser_exec /no-such-ws-browser-test-executable' 2>/dev/null
+assert_eq "exec failure preserves status" 127 "$?"
+assert_eq "exec failure is diagnosed" exec-failed "$(events)"
+
+# Direct logger validation rejects even plausible-looking arbitrary data.
+: > "$TMPD/diag.log"
+PATH="$TMPD/bin:/usr/bin:/bin" DIAG_LOG="$TMPD/diag.log" bash -c \
+  'source "$WS_BROWSER_LIB"; ws_browser_log "https://SECRET.test"; ws_browser_log "SECRET"'
+assert_eq "logger itself rejects non-enumerated messages" '' "$(events)"
+
+printf '\n%s\n' "$([[ $fails -eq 0 ]] && echo 'all ws-open contracts hold' || echo "$fails failing")"
+exit $(( fails > 0 ))

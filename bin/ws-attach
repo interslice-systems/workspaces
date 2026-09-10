@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# ws-attach — open or focus the terminal+tmux pair for the active workspace.
+# The tmux session name IS the identity: derived from the workspace's name,
+# sanitized by the shared wsid_session_name rules. Tmux client ancestry
+# identifies an existing local terminal. Exact session matches win globally; an
+# association on the active workspace is the rename-skew fallback; XDG chooses
+# the terminal for a new one.
+#
+# NAME ON CREATE (2026-08-26): an UNNAMED workspace (name empty or equal to its
+# id) with no terminal yet is a task space being born, so the launch is preceded
+# by a prompt for its name; the workspace is renamed and the session follows.
+# Cancel = nothing happens. Workspace names are no longer seeded in monitors.lua.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+source "$HOME/.local/lib/workspace-identity-lib"
+
+notify() { omarchy-notification-send -u low "$@" 2>/dev/null || true; }
+
+aw="$(hyprctl activeworkspace -j)"
+name="$(jq -r '.name' <<<"$aw")"
+workspace_id="$(jq -er '.id | select(type == "number" and floor == .)' <<<"$aw")"
+unnamed=0; [[ -z "$name" || "$name" == "$workspace_id" ]] && unnamed=1
+session="$(wsid_session_name "$name")"
+
+if ! associations="$(tmux-local-clients)"; then
+	printf 'ws-attach: cannot resolve local tmux clients\n' >&2
+	exit 1
+fi
+if ! addr="$(jq -er --arg s "$session" --argjson workspace_id "$workspace_id" '
+    map(select(.session == $s)) as $exact
+    | if ($exact | length) > 0 then $exact
+      else map(select(.workspace.id == $workspace_id))
+      end
+    | if length == 0 then "" else min_by([.focusHistoryID, .address]).address end
+  ' <<<"$associations")"; then
+	printf 'ws-attach: invalid tmux-local-clients output\n' >&2
+	exit 1
+fi
+
+if [[ -n "$addr" ]]; then
+	exec hyprctl dispatch focuswindow "address:$addr"
+fi
+
+if (( ! unnamed )) && [[ -z "$session" ]]; then
+	notify "Name refused" "workspace name has no usable characters"
+	exit 0
+fi
+
+if (( unnamed )); then
+	raw="$(omarchy-menu-input "Name this task space (workspace $workspace_id)" --width 420 || true)"
+	[[ -n "$raw" ]] || exit 0
+	new="$(wsid_session_name "$raw")"
+	if reason="$(wsid_reject_name "$new" "$workspace_id")"; then
+		notify "Name refused" "$reason"
+		exit 0
+	fi
+	wsid_rename_workspace "$workspace_id" "$new" >/dev/null
+	session="$new"
+fi
+
+exec xdg-terminal-exec -- \
+	tmux new-session -A -s "$session" \; set-option detach-on-destroy on

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# test-workspace-identity-lib — hash/palette/sanitize contract for the colorhash lib.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+fails=0
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then echo "ok   - $1"; else
+    echo "FAIL - $1"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$2" "$3"
+    fails=$((fails + 1))
+  fi
+}
+
+# The assertions below are Petroff 10 hexes, so this pins the palette to the
+# installed contract (github.com/interslice-systems/colorhash) and skips when
+# it is absent rather than reading whatever else might be around.
+export WSID_PALETTE_FILE="${WSID_PALETTE_FILE:-$HOME/.config/colorhash/palette.json}"
+if [[ ! -r "$WSID_PALETTE_FILE" ]]; then
+  echo "SKIP - colorhash palette not present at $WSID_PALETTE_FILE"; exit 0
+fi
+# shellcheck source=/dev/null
+source "$HERE/../lib/workspace-identity-lib"
+set +e
+
+export WSID_THEME_DIR=/nonexistent   # force dark theme
+
+# --- the frozen hash contract -------------------------------------------------------
+# FNV1a32 of the UTF-8 bytes. These are the SAME values colorhash/vectors.json carries
+# and lab.html's runSelfTest checks, transcribed here so a bash-side regression cannot
+# hide behind a passing JS suite. The hash is frozen; cell indices move with N.
+assert_eq "fnv1a32 of empty string" "811c9dc5" "$(printf '%08x' "$(wsid_hash '')")"
+assert_eq "fnv1a32 of 'a'"          "e40c292c" "$(printf '%08x' "$(wsid_hash a)")"
+assert_eq "fnv1a32 of 'mirepoix'"   "2f81feba" "$(printf '%08x' "$(wsid_hash mirepoix)")"
+assert_eq "fnv1a32 of 'oracle'"     "f4e20ef7" "$(printf '%08x' "$(wsid_hash oracle)")"
+assert_eq "fnv1a32 of 'café'"       "a82b5049" "$(printf '%08x' "$(wsid_hash café)")"
+assert_eq "fnv1a32 normalizes decomposed Unicode to NFC" \
+  "$(wsid_hash café)" "$(wsid_hash $'cafe\u0301')"
+assert_eq "fnv1a32 of 'recipe box'" "9a56501a" "$(printf '%08x' "$(wsid_hash 'recipe box')")"
+
+# --- name -> cell -> surfaces -------------------------------------------------------
+assert_eq "mirepoix lands on cell 6"  "6" "$(wsid_cell 0 mirepoix)"
+assert_eq "oracle lands on cell 1"    "1" "$(wsid_cell 0 oracle)"
+assert_eq "mirepoix bg"    "#e76300" "$(wsid_color 0 mirepoix)"
+assert_eq "oracle bg"      "#ffa90e" "$(wsid_color 0 oracle)"
+assert_eq "mirepoix fg on a dark theme" "#ff8b50" "$(wsid_fg 0 mirepoix)"
+assert_eq "mirepoix led" "#be5000" "$(wsid_led 0 mirepoix)"
+
+# Collisions at n=10 are expected and not a defect — color is a recognition aid keyed
+# to the name, not an identity channel. Pinned so a palette resize is a visible change.
+assert_eq "oracle and dotfiles collide" "$(wsid_color 0 oracle)" "$(wsid_color 0 dotfiles)"
+
+# bgText is polarity, never a fixed black. Three of the ten Petroff cells need white;
+# hardcoding black at a call site renders those unreadable, which is the bug that
+# forced @wsid_text into statusbar.conf.
+assert_eq "light cell takes black text" "#000000" "$(wsid_text 0 oracle)"
+assert_eq "dark cell takes white text"  "#ffffff" "$(wsid_text 0 keymaker)"
+
+assert_eq "ff_color oracle is yellow"   "yellow" "$(wsid_ff_color 2 oracle)"
+assert_eq "ff_color mirepoix is orange" "orange" "$(wsid_ff_color 1 mirepoix)"
+assert_eq "ff_color keymaker is purple" "purple" "$(wsid_ff_color 4 keymaker)"
+assert_eq "ff_color ladybird is red"    "red"    "$(wsid_ff_color 9 ladybird)"
+assert_eq "ff_color hey is cyan"        "cyan"   "$(wsid_ff_color 7 hey)"
+assert_eq "ff_color superpowers is grey" "grey"  "$(wsid_ff_color 3 superpowers)"
+
+# Cell 1 and cell 7 collide on yellow by construction; both must be stable.
+assert_eq "ff_color media is yellow"    "yellow" "$(wsid_ff_color 5 media)"
+
+# Every emitted value must be one of Firefox's nine, spelled its way.
+for name in oracle mirepoix keymaker ladybird hey superpowers media tries woz interslice; do
+  case "$(wsid_ff_color 1 "$name")" in
+    blue|cyan|grey|green|orange|pink|purple|red|yellow) ;;
+    *) printf 'FAIL - %s produced a colour outside the nine\n' "$name"; fails=$((fails + 1)) ;;
+  esac
+done
+
+TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
+touch "$TMPD/light.mode"
+assert_eq "light.mode flips the foreground" "#913b00" "$(WSID_THEME_DIR=$TMPD wsid_fg 0 mirepoix)"
+assert_eq "light.mode leaves the fill alone" "#e76300" "$(WSID_THEME_DIR=$TMPD wsid_color 0 mirepoix)"
+
+# Omarchy 4 marks light themes inside colors.toml instead of a marker file.
+rm -f "$TMPD/light.mode"
+printf 'name = "latte"\nmode = "light"\n' > "$TMPD/colors.toml"
+assert_eq "colors.toml mode=light flips the foreground" "#913b00" "$(WSID_THEME_DIR=$TMPD wsid_fg 0 mirepoix)"
+printf 'mode = "dark"\n' > "$TMPD/colors.toml"
+assert_eq "colors.toml mode=dark stays dark" "$(wsid_fg 0 mirepoix)" "$(WSID_THEME_DIR=$TMPD wsid_fg 0 mirepoix)"
+
+# --- rename guards (shared by ws-rename and ws-rename-workspace) ---------------------
+assert_eq "reject: bare number"   "0" "$(wsid_reject_name 42 >/dev/null; echo $?)"
+assert_eq "reject: special:"      "0" "$(wsid_reject_name special:magic >/dev/null; echo $?)"
+assert_eq "reject: empty"         "0" "$(wsid_reject_name '' >/dev/null; echo $?)"
+assert_eq "accept: ordinary name" "1" "$(wsid_reject_name oracle >/dev/null; echo $?)"
+assert_eq "accept: dashed name"   "1" "$(wsid_reject_name recipe-box >/dev/null; echo $?)"
+
+assert_eq "falls back to id when no label" "$(wsid_color 7)" "$(wsid_color 7 "")"
+
+# --- canonical task-space names (operatord's port must match) ------------------------
+assert_eq "canonical: tmux target/format metacharacters" \
+  "a-b-c-d-e" "$(wsid_session_name "a.b:c/d#e")"
+assert_eq "canonical: ASCII whitespace and controls" \
+  "a-b-c-d" "$(wsid_session_name $'a\tb\nc\177d')"
+assert_eq "canonical: repeated separators collapse" \
+  "a-b" "$(wsid_session_name "a.#-b")"
+assert_eq "canonical: edge separators disappear" \
+  "x" "$(wsid_session_name " .#x: ")"
+assert_eq "canonical: valid Unicode is preserved" \
+  "café-日本語" "$(wsid_session_name "café-日本語")"
+assert_eq "canonical: unusable input becomes empty" \
+  "" "$(wsid_session_name $' #.:/\t')"
+
+# --- retired surface -----------------------------------------------------------------
+assert_eq "deleted: wsid_compose gone" "" "$(type -t wsid_compose)"
+assert_eq "deleted: wsid_parse gone"   "" "$(type -t wsid_parse)"
+assert_eq "deleted: cksum palettes gone" "" "${WSID_PALETTE_DARK[*]:-}"
+
+# --- fail-closed on color, never on naming -------------------------------------------
+# ws-attach sources this lib under `set -euo pipefail` and uses ONLY wsid_session_name.
+# A lib that refused to source without a palette would take SUPER+ALT+ENTER down over a
+# missing color file. Naming is load-bearing; color is a recognition aid.
+cat > "$TMPD/probe.sh" <<PROBE
+set -euo pipefail
+export WSID_PALETTE_FILE="$TMPD/absent.json"
+source "$HERE/../lib/workspace-identity-lib"
+wsid_session_name "wacky sax"
+wsid_have_palette && echo " UNEXPECTED-PALETTE"
+exit 0
+PROBE
+assert_eq "sources cleanly under set -e with no palette" "wacky-sax" "$(bash "$TMPD/probe.sh" 2>&1)"
+assert_eq "no palette: color accessor fails, prints nothing" \
+  "rc=1|" "$(WSID_PALETTE_FILE=$TMPD/absent.json bash -c '
+    source "'"$HERE"'/../lib/workspace-identity-lib"
+    out="$(wsid_color 0 oracle)"; printf "rc=%s|%s" "$?" "$out"')"
+assert_eq "no uconv: color accessor fails, prints nothing" \
+  "rc=1|" "$(/usr/bin/bash -c '
+    source "'"$HERE"'/../lib/workspace-identity-lib"
+    PATH=/nonexistent
+    out="$(wsid_color 0 oracle 2>&1)"; printf "rc=%s|%s" "$?" "$out"' 2>&1)"
+assert_eq "invalid UTF-8: color accessor fails, prints nothing" \
+  "rc=1|" "$(/usr/bin/bash -c '
+    source "'"$HERE"'/../lib/workspace-identity-lib"
+    out="$(wsid_color 0 "$1" 2>&1)"; printf "rc=%s|%s" "$?" "$out"' \
+    _ $'\xff' 2>&1)"
+
+echo; [[ $fails -eq 0 ]] && echo "ALL OK" || { echo "$fails FAILURES"; exit 1; }

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Browser-facing adapter for ws-open.desktop and Omarchy's browser launcher.
+# Keep the URL router strict; browser control flags never enter the bridge.
+set -uo pipefail
+# shellcheck source=/dev/null
+source "${WS_BROWSER_LIB:-$HOME/.local/lib/ws-browser-lib.bash}" || exit 70
+FIREFOX="${WS_OPEN_FIREFOX:-/usr/bin/firefox}"
+ROUTER="${WS_OPEN_ROUTER:-$HOME/.local/bin/ws-open}"
+
+reject() { ws_browser_log adapter-invalid-invocation; exit 64; }
+
+if (( $# == 0 )); then
+  ws_browser_log adapter-normal-launch
+  ws_browser_exec "$FIREFOX"
+fi
+
+case "$1" in
+  --help|-h|--version|-v)
+    (( $# == 1 )) || reject
+    # Omarchy identifies Firefox from MOZ_LOG in its real help output.
+    # This is a capability probe, not a launch; no routine diagnostic entry.
+    ws_browser_exec "$FIREFOX" "$1"
+    ;;
+  --private|--private-window|--incognito)
+    (( $# == 1 || $# == 2 )) || reject
+    if (( $# == 2 )); then
+      ws_browser_valid_url "$2" || reject
+    fi
+    shift
+    ws_browser_log adapter-private-launch
+    ws_browser_exec "$FIREFOX" --private-window "$@"
+    ;;
+  --new-window)
+    (( $# == 2 )) || reject
+    ws_browser_valid_url "$2" || reject
+    ws_browser_log adapter-new-window
+    ws_browser_exec "$FIREFOX" --new-window "$2"
+    ;;
+  *)
+    ws_browser_valid_url "$@" || reject
+    ws_browser_log adapter-route
+    ws_browser_exec "$ROUTER" "$1"
+    ;;
+esac

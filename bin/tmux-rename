@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# tmux-rename -- rename the current tmux window or session in a popup.
+#
+# Usage: tmux-rename [window|session]        (default: window)
+#
+# WHY THIS EXISTS
+# tmux's command prompt is an OVERLAY on the status bar, not a replacement.
+# status_prompt_redraw() blits the saved status screen underneath the prompt, then
+# writes the prompt over only the columns it occupies -- it never clears the line and
+# never pads to full width. So the name being typed sits directly alongside a live
+# window list with nothing between them. An opaque message-style (statusbar.conf)
+# gives the input a boundary, but nothing reachable by styling can remove the leftover
+# bar to its right. A popup is drawn over the panes and owns every cell it covers, so
+# the problem is gone rather than mitigated.
+#
+# Bound to prefix-, / prefix-r (window) and prefix-$ / prefix-R (session) in
+# ~/.config/tmux/statusbar.conf. Those bindings live there rather than in ~/.tmux.conf
+# because Omarchy binds `r` and `R` itself and loads afterwards; only the
+# client-attached hook lands late enough to win.
+#
+# CANCEL IS C-c (or C-d on an empty field). Escape does nothing at all -- readline
+# treats a bare \e as an unfinished meta prefix and swallows it. Escape-to-cancel is
+# possible, via an INPUTRC holding the macro '"\e": "\C-u\C-m"', but it was cut on
+# purpose: it was the only trick in here, and a smaller surface was worth more than
+# the keystroke. The popup title advertises ^C so the missing affordance is not
+# something you have to remember. Do not reintroduce it on the strength of
+# display-popup's man page, which says -k "allows any key to dismiss the popup instead
+# of only Escape or C-c" -- that built-in dismissal does NOT apply while a -E
+# shell-command is running, because keys go to the program. Verified by testing.
+#
+# WHICH WINDOW/SESSION -- nothing is passed in, and that is deliberate.
+# display-popup does NOT expand formats in its shell-command, nor in its -e values. A
+# binding written with '#{window_id}' hands this script that string LITERALLY, and
+# `tmux display-message -t '#{window_id}'` then exits 0 with EMPTY output instead of
+# failing -- silent, and indistinguishable from an unnamed window. (A static literal
+# like `session` above passes through fine; only formats do not.)
+#
+# tmux does not set TMUX_PANE in a popup either. It only appears to when tmux is
+# nested, where the outer pane's value leaks in through the server environment -- an
+# earlier version of this script relied on that and broke the moment it was tested on
+# a server that had not inherited one.
+#
+# What does hold: a popup's tmux commands resolve against the client that opened it,
+# because pressing the key stamps that session as the most recently active. Verified
+# with two clients attached where the OTHER session had the later activity stamp. So
+# the id is resolved once, untargeted, at popup-open time, and every command after
+# that names the id -- which also closes the race where a different client becomes
+# "current" while the name is still being typed.
+
+set -uo pipefail
+
+# allow_empty: clearing the field and pressing Enter blanks a WINDOW name, which is a
+# real thing to want -- a window list of bare indices. tmux accepts it, leaves
+# automatic-rename off, and the blank sticks rather than being repopulated.
+#
+# Sessions are guarded instead. `rename-session -- ''` also succeeds, silently, but an
+# unnamed session cannot be addressed by name (switch-client -t, attach -t) and blanks
+# the identity segment the status bar deliberately keeps on the left. Cancel is C-c.
+case ${1:-window} in
+	window)  idfmt='#{window_id}'  ; namefmt='#W' ; cmd=rename-window  ; allow_empty=1 ;;
+	session) idfmt='#{session_id}' ; namefmt='#S' ; cmd=rename-session ; allow_empty=0 ;;
+	*) exit 0 ;;
+esac
+
+id=$(tmux display-message -p "$idfmt" 2>/dev/null) || exit 0
+[[ -n $id ]] || exit 0   # guard the exits-0-but-empty case above
+current=$(tmux display-message -p -t "$id" "$namefmt" 2>/dev/null) || exit 0
+
+# C-c and C-d cancel by failing the read.
+IFS= read -r -e -i "$current" -p ' ' name || exit 0
+
+if [[ -z $name && $allow_empty -eq 0 ]]; then
+	# -d 1500 because display-time defaults to 750ms, too brief to read a refusal.
+	# The message lands on the status line and so is itself an overlay, leftover bar
+	# and all -- legible only because message-style was made opaque. See statusbar.conf.
+	tmux display-message -d 1500 "session name cannot be empty"
+	exit 0
+fi
+
+[[ $name != "$current" ]] || exit 0  # no-op: for a window this would also switch automatic-rename off
+
+tmux "$cmd" -t "$id" -- "$name"

@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# test-wsid-tmux-colors — what the stamper writes into tmux options.
+#
+# The bar reads colorhash entirely through tmux user options, so this suite is the
+# contract between wsid-tmux-colors and statusbar.conf. It asserts on option VALUES
+# rather than on rendered output: a rendered bar is full of glyphs and chevrons that
+# make a diff unreadable, while the options are exactly what the formats consume.
+#
+# THE THROWAWAY SERVER MUST BE STARTED WITH `-f /dev/null`. Without it the server
+# loads ~/.tmux.conf, whose client-attached / session-created hooks fire the INSTALLED
+# stamper with `run-shell -b` and race every value this file sets.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+fails=0
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then echo "ok   - $1"; else
+    echo "FAIL - $1"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$2" "$3"
+    fails=$((fails + 1))
+  fi
+}
+
+command -v tmux >/dev/null || { echo "SKIP - tmux not installed"; exit 0; }
+command -v jq   >/dev/null || { echo "SKIP - jq not installed";   exit 0; }
+
+# The assertions below are Petroff 10 hexes, so this pins the palette to the
+# installed contract (github.com/interslice-systems/colorhash) and skips when
+# it is absent rather than reading whatever else might be around.
+export WSID_PALETTE_FILE="${WSID_PALETTE_FILE:-$HOME/.config/colorhash/palette.json}"
+[[ -r "$WSID_PALETTE_FILE" ]] || { echo "SKIP - no palette at $WSID_PALETTE_FILE"; exit 0; }
+
+export WSID_THEME_DIR=/nonexistent   # force the dark foregrounds
+# shellcheck source=/dev/null
+source "$HERE/../lib/workspace-identity-lib"
+set +e
+
+STAMP="$HERE/../bin/wsid-tmux-colors"
+SOCK="wsidtest-$$"
+export WSID_TMUX_CMD="tmux -L $SOCK"
+T=(tmux -L "$SOCK")
+
+cleanup() { "${T[@]}" kill-server 2>/dev/null; }
+trap cleanup EXIT
+cleanup
+
+# base-index cannot be set before the server exists, and new-session has already made
+# window 0 by the time it can be. move-window -r renumbers from the new base, which is
+# what the real config gets for free by having base-index set at load time.
+"${T[@]}" -f /dev/null new-session -d -s mirepoix -x 80 -y 24 >/dev/null 2>&1
+"${T[@]}" set -g base-index 1 >/dev/null
+"${T[@]}" setw -g automatic-rename off >/dev/null
+"${T[@]}" rename-window -t 'mirepoix:' import-loop >/dev/null
+"${T[@]}" move-window -r -s 'mirepoix:' >/dev/null
+"${T[@]}" new-window -d -t 'mirepoix:' -n recipe-page-redesign >/dev/null
+"${T[@]}" new-session -d -s oracle -x 80 -y 24 >/dev/null 2>&1
+"${T[@]}" rename-window -t 'oracle:' oracle >/dev/null
+"${T[@]}" move-window -r -s 'oracle:' >/dev/null
+
+get()  { "${T[@]}" show -gqv "$1" 2>/dev/null; }               # global
+getw() { "${T[@]}" show -wqv -t "$1" "$2" 2>/dev/null; }       # window scope
+gets() { "${T[@]}" show -qv  -t "$1" "$2" 2>/dev/null; }       # session scope
+
+"$STAMP"
+
+# --- availability sentinel ----------------------------------------------------------
+# statusbar.conf branches its whole wsid/plain choice on this one option. It replaced
+# @wsid_win1, which went away with the index bins.
+assert_eq "@wsid_ok marks colorhash available" "1" "$(get @wsid_ok)"
+
+# --- the host segment ---------------------------------------------------------------
+# Hashing the host pins it to a hex, so it stops re-theming with Omarchy. That is a
+# deliberate trade: the segment earns its keep the moment a mosh session to another
+# box is on screen.
+HOST="$(hostname -s)"
+assert_eq "host bg is the hash of the short hostname" \
+  "$(wsid_color 0 "$HOST")" "$(get @wsid_host_color)"
+assert_eq "host text is WCAG polarity, not a fixed black" \
+  "$(wsid_text 0 "$HOST")" "$(get @wsid_host_text)"
+
+# --- the session segment (unchanged behaviour, pinned against regression) -----------
+assert_eq "session bg still hashes the session name" \
+  "#e76300" "$(gets 'mirepoix:' @wsid_color)"
+assert_eq "session text still set beside it" \
+  "#000000" "$(gets 'mirepoix:' @wsid_text)"
+
+# --- per-window foregrounds: the whole point of the change --------------------------
+# @wsid_wfg is WINDOW-scoped. window-status-format resolves user options at window
+# scope, so one option name serves every entry in the list.
+assert_eq "window 1 takes the hash of its NAME" \
+  "$(wsid_fg 0 import-loop)"          "$(getw 'mirepoix:1' @wsid_wfg)"
+assert_eq "window 2 takes the hash of its NAME" \
+  "$(wsid_fg 0 recipe-page-redesign)" "$(getw 'mirepoix:2' @wsid_wfg)"
+assert_eq "stamps windows in every session, not just the first" \
+  "$(wsid_fg 0 oracle)"               "$(getw 'oracle:1' @wsid_wfg)"
+
+# --- per-window pill surfaces: fill + text for the CURRENT window's block ----------
+# @sb_curwin_wsid renders the active window as a pill. Its fill is the bg surface of
+# the window's name and its text is that fill's WCAG polarity — the same pair the
+# session pill uses, so a session and window sharing a name render identical pills.
+# (Until 2026-08-22 the pill was made with `reverse`, which used the fg surface as a
+# fill: an unvetted surface-role swap, visible as two different ambers for "oracle".)
+assert_eq "window pill fill is the bg surface of the window name" \
+  "$(wsid_color 0 import-loop)" "$(getw 'mirepoix:1' @wsid_wbg)"
+assert_eq "window pill text is that fill's WCAG polarity" \
+  "$(wsid_text 0 import-loop)"  "$(getw 'mirepoix:1' @wsid_wtext)"
+assert_eq "a same-named session and window get the SAME fill" \
+  "$(gets 'oracle:' @wsid_color)" "$(getw 'oracle:1' @wsid_wbg)"
+
+# The live collision, asserted rather than apologised for: these two names share cell 7.
+# Color is a recognition aid keyed to a name, not an identity channel.
+assert_eq "import-loop and recipe-page-redesign collide on one cell" \
+  "$(getw 'mirepoix:1' @wsid_wfg)" "$(getw 'mirepoix:2' @wsid_wfg)"
+
+# --- the property Chris actually asked for ------------------------------------------
+# Close window 1; renumber-windows slides recipe-page-redesign into index 1. Under the
+# old index bins its colour changed. Under the hash it must not.
+BEFORE="$(getw 'mirepoix:2' @wsid_wfg)"
+"${T[@]}" set -g renumber-windows on >/dev/null
+"${T[@]}" kill-window -t 'mirepoix:1' >/dev/null
+"$STAMP"
+assert_eq "a window keeps its colour when its neighbour closes" \
+  "$BEFORE" "$(getw 'mirepoix:1' @wsid_wfg)"
+assert_eq "...and it really did move to index 1" \
+  "recipe-page-redesign" "$("${T[@]}" display -p -t 'mirepoix:1' '#{window_name}')"
+
+# --- targeted mode: what the window-renamed hook calls ------------------------------
+# The hook fires on every automatic rename, i.e. on every cd. Restamping all windows
+# in all sessions there would be gratuitous, so -w does exactly one.
+"${T[@]}" new-window -d -t 'mirepoix:' -n scratch >/dev/null
+"${T[@]}" set -uw -t 'mirepoix:1' @wsid_wfg >/dev/null    # clear a neighbour to prove isolation
+"$STAMP" -w 'mirepoix:2'
+assert_eq "-w stamps its target" \
+  "$(wsid_fg 0 scratch)" "$(getw 'mirepoix:2' @wsid_wfg)"
+assert_eq "-w leaves other windows alone" \
+  "" "$(getw 'mirepoix:1' @wsid_wfg)"
+
+# -n <name>: the authoritative name, supplied by the caller.
+# AT window-renamed FIRE TIME THE SERVER STILL REPORTS THE OLD NAME. Reading
+# #{window_name} back from inside the hook lags the stamp exactly one rename behind --
+# observed as a window wearing its previous directory's colour after every cd. The hook
+# passes #{hook_window_name}, which is correct at fire time, and -n makes the script use
+# it instead of asking. Bare invocations still read the name themselves.
+"${T[@]}" rename-window -t 'mirepoix:2' actual-name >/dev/null
+"$STAMP" -w 'mirepoix:2' -n a-different-name
+assert_eq "-n overrides the name read from tmux" \
+  "$(wsid_fg 0 a-different-name)" "$(getw 'mirepoix:2' @wsid_wfg)"
+"$STAMP" -w 'mirepoix:2'
+assert_eq "without -n the window's own name is used" \
+  "$(wsid_fg 0 actual-name)" "$(getw 'mirepoix:2' @wsid_wfg)"
+
+# AUTOMATIC RENAMES IGNORE -n. window-renamed fires from tmux's periodic name check
+# before the new name is committed, and the first hook in the array expands its formats
+# at that moment -- so #{hook_window_name} arrives holding the PREVIOUS name and the
+# stamp lands one cd behind. pane_current_path IS current then, so an auto-named window
+# takes its name from its own automatic-rename-format instead.
+"${T[@]}" new-window -d -t 'mirepoix:' -c /tmp -n stalename >/dev/null
+AUTOWIN="$("${T[@]}" display -p -t 'mirepoix:3' '#{window_id}')"
+"${T[@]}" setw -t "$AUTOWIN" automatic-rename on >/dev/null
+"${T[@]}" setw -t "$AUTOWIN" automatic-rename-format '#{b:pane_current_path}' >/dev/null
+"$STAMP" -w "$AUTOWIN" -n stalename
+assert_eq "auto-named window ignores a stale -n and follows its path" \
+  "$(wsid_fg 0 tmp)" "$(getw "$AUTOWIN" @wsid_wfg)"
+
+# THE OPTIONS ARE NORMALLY GLOBAL. `show-options -w` reports only what is set ON the
+# window, so a lookup with no global fallback returns "" and the branch above never runs
+# -- which is exactly how this shipped broken once: units green, every cd off by one.
+"${T[@]}" setw -u -t "$AUTOWIN" automatic-rename >/dev/null
+"${T[@]}" setw -u -t "$AUTOWIN" automatic-rename-format >/dev/null
+"${T[@]}" setw -g automatic-rename on >/dev/null
+"${T[@]}" setw -g automatic-rename-format '#{b:pane_current_path}' >/dev/null
+"${T[@]}" set -uw -t "$AUTOWIN" @wsid_wfg >/dev/null
+"$STAMP" -w "$AUTOWIN" -n stalename
+assert_eq "globally-set automatic-rename is still seen" \
+  "$(wsid_fg 0 tmp)" "$(getw "$AUTOWIN" @wsid_wfg)"
+"${T[@]}" setw -g automatic-rename off >/dev/null
+
+# A manually renamed window has automatic-rename off, and there -n is authoritative:
+# rename-window commits before notifying, so the hook's name is the new one.
+"$STAMP" -w "$AUTOWIN" -n handpicked
+assert_eq "manually named window trusts -n" \
+  "$(wsid_fg 0 handpicked)" "$(getw "$AUTOWIN" @wsid_wfg)"
+
+# The format is read from the window, not assumed.
+"${T[@]}" setw -t "$AUTOWIN" automatic-rename on >/dev/null
+"${T[@]}" setw -t "$AUTOWIN" automatic-rename-format 'fixed-by-format' >/dev/null
+"$STAMP" -w "$AUTOWIN" -n stalename
+assert_eq "auto name comes from that window's automatic-rename-format" \
+  "$(wsid_fg 0 fixed-by-format)" "$(getw "$AUTOWIN" @wsid_wfg)"
+"${T[@]}" kill-window -t "$AUTOWIN" >/dev/null
+
+# An unstamped window must resolve EMPTY, not to some global default — statusbar.conf
+# distinguishes "not yet stamped" from "no colorhash" by that emptiness, and falls back
+# to plain `white` for both. A global @wsid_wfg would silently defeat the guard.
+assert_eq "no global @wsid_wfg exists to shadow the fallback" "" "$(get @wsid_wfg)"
+assert_eq "no global @wsid_wbg either" "" "$(get @wsid_wbg)"
+assert_eq "no global @wsid_wtext either" "" "$(get @wsid_wtext)"
+
+# --- degradation --------------------------------------------------------------------
+# Colours are the whole job here, so a missing palette exits 0 having written nothing,
+# leaving the bar on its ANSI rendering rather than on a wrong-but-plausible palette.
+"${T[@]}" set -ug @wsid_ok >/dev/null
+WSID_PALETTE_FILE=/nonexistent/palette.json "$STAMP"
+rc=$?
+assert_eq "no palette: exits 0" "0" "$rc"
+assert_eq "no palette: writes no sentinel" "" "$(get @wsid_ok)"
+
+echo; [[ $fails -eq 0 ]] && echo "ALL OK" || { echo "$fails FAILURES"; exit 1; }

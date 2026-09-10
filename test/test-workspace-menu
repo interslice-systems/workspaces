@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# Structural regression contract for workspace-menu async and security invariants.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+plugin_dir="${WORKSPACE_PLUGIN_DIR:-$here/..}"
+workspaces="$plugin_dir/Workspaces.qml"
+menu="$plugin_dir/WsMenu.qml"
+firefox_icon="$plugin_dir/assets/firefox.png"
+fails=0
+
+pass() { printf 'ok   - %s\n' "$1"; }
+fail() { printf 'FAIL - %s\n' "$1"; fails=$((fails + 1)); }
+
+assert_contains() {
+  local name=$1 needle=$2 file=$3
+  if rg -Fq "$needle" "$file"; then pass "$name"; else
+    fail "$name"
+    printf '       missing from %s: %s\n' "$file" "$needle"
+  fi
+}
+
+assert_not_contains() {
+  local name=$1 needle=$2 file=$3
+  if rg -Fq "$needle" "$file"; then
+    fail "$name"
+    printf '       forbidden in %s: %s\n' "$file" "$needle"
+  else pass "$name"; fi
+}
+
+assert_not_matches() {
+  local name=$1 pattern=$2 file=$3
+  if rg -Uq -- "$pattern" "$file"; then
+    fail "$name"
+    printf '       forbidden pattern in %s: %s\n' "$file" "$pattern"
+  else pass "$name"; fi
+}
+
+assert_multiline() {
+  local name=$1 needle=$2 file=$3
+  if rg -U -Fq -- "$needle" "$file"; then pass "$name"; else
+    fail "$name"
+    printf '       missing multiline contract from %s:\n%s\n' "$file" "$needle"
+  fi
+}
+
+assert_count() {
+  local name=$1 expected=$2 needle=$3 file=$4 actual
+  actual=$(rg -F -o -- "$needle" "$file" 2>/dev/null | wc -l)
+  if (( actual == expected )); then pass "$name"; else
+    fail "$name"
+    printf '       expected %s occurrence(s), found %s: %s\n' "$expected" "$actual" "$needle"
+  fi
+}
+
+assert_regex_count() {
+  local name=$1 expected=$2 pattern=$3 file=$4 actual
+  actual=$(rg -U --count-matches -- "$pattern" "$file" 2>/dev/null)
+  actual=${actual:-0}
+  if (( actual == expected )); then pass "$name"; else
+    fail "$name"
+    printf '       expected %s regex match(es), found %s: %s\n' "$expected" "$actual" "$pattern"
+  fi
+}
+
+assert_contains "tmux window readiness is explicit" \
+  'property bool tmuxWindowsReady: false' "$workspaces"
+assert_contains "tmux client readiness is explicit" \
+  'property bool tmuxClientsReady: false' "$workspaces"
+assert_contains "tmux waits for both process results" \
+  'if (root.tmuxWindowsReady && root.tmuxClientsReady) root.tmuxLoading = false' "$workspaces"
+assert_contains "workspace colorhash delegates to the headless-tested helper" \
+  'function fnv1a32(s) { return WorkspaceMenuModel.fnv1a32(s) }' "$workspaces"
+
+assert_contains "Firefox state starts empty" \
+  'property var firefoxTabs: []' "$workspaces"
+assert_contains "Firefox applicability is explicit" \
+  'property bool firefoxApplicable: false' "$workspaces"
+assert_contains "Firefox loading is explicit" \
+  'property bool firefoxLoading: false' "$workspaces"
+assert_contains "bridge path is exact" \
+  'Quickshell.env("HOME") + "/.local/bin/omarchy-firefox-bridge"' "$workspaces"
+assert_contains "tabs command uses an always-present argv launcher" \
+  'command: ["/usr/bin/env", root.firefoxBridgePath, "tabs"]' "$workspaces"
+assert_count "tabs command is declared exactly once" 1 \
+  'command: ["/usr/bin/env", root.firefoxBridgePath, "tabs"]' "$workspaces"
+assert_count "bridge executable is referenced exactly once" 1 \
+  'omarchy-firefox-bridge' "$workspaces"
+assert_count "bridge path property is declared exactly once" 1 \
+  'readonly property string firefoxBridgePath:' "$workspaces"
+assert_count "tabs argv token is declared exactly once" 1 \
+  '"tabs"' "$workspaces"
+# This is a conservative source contract, not a semantic QML proof: every
+# current sink is counted and pinned so an added override fails closed.
+assert_regex_count "workspace has exactly six semantic command sinks" 6 \
+  '(^|[^[:alnum:]_])(command[[:space:]]*:|[[:alnum:]_]+[[:space:]]*\.[[:space:]]*command[[:space:]]*=)' "$workspaces"
+assert_multiline "tmux window command is pinned to its Process" \
+  $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{P:|#{pane_title}}"]' "$workspaces"
+assert_multiline "tmux client command is pinned to its Process" \
+  $'  Process {\n    id: tmuxClientsProc\n    command: [Quickshell.env("HOME") + "/.local/bin/tmux-local-clients"]' "$workspaces"
+assert_multiline "snapshot command is pinned to its Process" \
+  $'  Process {\n    id: firefoxTabsProc\n    property int requestGeneration: -1\n    command: ["/usr/bin/env", root.firefoxBridgePath, "tabs"]' "$workspaces"
+assert_multiline "activation command starts empty in its Process" \
+  $'  Process {\n    id: firefoxActivateProc\n    command: []' "$workspaces"
+assert_multiline "rename suggestion command is pinned to its Process" \
+  $'  Process {\n    id: suggestProc\n    command: [Quickshell.env("HOME") + "/.local/bin/ws-name-suggest"]' "$workspaces"
+assert_not_matches "snapshot command has no imperative override" \
+  'firefoxTabsProc[[:space:]]*\.[[:space:]]*command[[:space:]]*=' "$workspaces"
+assert_not_matches "Firefox processes have no bracket-property writes" \
+  'firefox(Tabs|Activate)Proc[[:space:]]*\[[^]]+\][[:space:]]*=' "$workspaces"
+assert_not_matches "browser snapshot has no sh/bash-backed command" \
+  'command:\s*\[[^]]*"(/bin/)?(ba)?sh"[^]]*(firefox|tabs)|command:\s*\[[^]]*(firefox|tabs)[^]]*"(/bin/)?(ba)?sh"' "$workspaces"
+assert_not_matches "browser snapshot has no executable-agnostic -c command" \
+  'command:\s*\[[^]]*([^[:alnum:]_]-c[^[:alnum:]_][^]]*(root\.firefoxBridgePath|omarchy-firefox-bridge|\btabs\b)|(root\.firefoxBridgePath|omarchy-firefox-bridge|\btabs\b)[^]]*[^[:alnum:]_]-c[^[:alnum:]_])' "$workspaces"
+assert_not_matches "browser snapshot never uses bar.run" \
+  'bar\.run\([^\n]*(firefox|tabs)' "$workspaces"
+/usr/bin/env /definitely/missing/omarchy-firefox-bridge >/dev/null 2>&1
+missing_bridge_status=$?
+if [[ $missing_bridge_status == 127 ]]; then
+  pass "argv launcher converts a missing bridge to exit 127"
+else
+  fail "argv launcher converts a missing bridge to exit 127"
+fi
+assert_contains "stdout completion is tracked" \
+  'property bool firefoxOutputReady: false' "$workspaces"
+assert_contains "process exit is tracked" \
+  'property bool firefoxExitReady: false' "$workspaces"
+assert_contains "snapshot publishes only after both completions" \
+  'if (!root.firefoxOutputReady || !root.firefoxExitReady) return' "$workspaces"
+assert_contains "successful output uses the pure validator" \
+  'WorkspaceMenuModel.parseSnapshot(root.firefoxRawOutput)' "$workspaces"
+assert_multiline "stdout accepts only its exact current generation" \
+  $'        root.firefoxRawOutput = firefoxTabsProc.requestGeneration === root.firefoxGeneration\n          ? String(text || "") : ""' "$workspaces"
+assert_count "publication rejects a mismatched generation" 1 \
+  'if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration) {' "$workspaces"
+assert_contains "workspace class gates bridge work" \
+  'WorkspaceMenuModel.isFirefoxClass(String(ipc["class"] || ""))' "$workspaces"
+assert_contains "applicability rejects absent values" \
+  'if (!values || typeof values.length !== "number") return false' "$workspaces"
+assert_contains "applicability rejects invalid lengths" \
+  'if (!isFinite(length) || Math.floor(length) !== length || length < 0) return false' "$workspaces"
+assert_contains "applicability rejects malformed toplevels" \
+  'if (!toplevel || typeof toplevel !== "object") return false' "$workspaces"
+assert_contains "applicability rejects malformed IPC objects" \
+  'if (!ipc || typeof ipc !== "object") return false' "$workspaces"
+assert_multiline "applicability property errors fail closed" \
+  $'    } catch (e) {\n      return false\n    }' "$workspaces"
+assert_contains "closing clears ephemeral browser state" \
+  'onOpenChanged: if (!open) root.clearFirefoxSnapshot()' "$workspaces"
+assert_contains "close clears raw browser output" \
+  'root.firefoxRawOutput = ""' "$workspaces"
+assert_multiline "close invalidates and clears the complete Firefox snapshot" \
+  $'  function clearFirefoxSnapshot() {\n    root.firefoxGeneration++\n    root.firefoxTabs = []\n    root.firefoxApplicable = false\n    root.firefoxLoading = false\n    root.firefoxRestartPending = false\n    root.firefoxOutputReady = false\n    root.firefoxExitReady = false\n    root.firefoxExitCode = -1\n    root.firefoxRawOutput = ""\n    if (firefoxTabsProc.running) firefoxTabsProc.running = false\n  }' "$workspaces"
+assert_count "closed popup guards have no unexpected duplicates" 4 \
+  'if (!wsMenu.open) return' "$workspaces"
+assert_multiline "stdout callback ignores a fully closed popup" \
+  $'      onStreamFinished: {\n        if (!wsMenu.open) return\n        if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration && !root.firefoxRestartPending) return' "$workspaces"
+assert_multiline "exit callback ignores a fully closed popup" \
+  $'    onExited: function(exitCode) {\n      if (!wsMenu.open) return\n      if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration && !root.firefoxRestartPending) return' "$workspaces"
+assert_multiline "failed snapshot start closes the exact request as failed" \
+  $'    onRunningChanged: {\n      if (firefoxTabsProc.running || root.firefoxExitReady) return\n      if (!wsMenu.open) return\n      if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration && !root.firefoxRestartPending) return\n      root.firefoxRawOutput = ""\n      root.firefoxOutputReady = true\n      root.firefoxExitCode = -1\n      root.firefoxExitReady = true\n      root.finishFirefoxRefresh()\n    }' "$workspaces"
+assert_count "all snapshot callbacks reject stale work without a replacement" 3 \
+  'if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration && !root.firefoxRestartPending) return' "$workspaces"
+assert_not_contains "stale callback guards preserve a pending replacement drain" \
+  'if (firefoxTabsProc.requestGeneration !== root.firefoxGeneration) return' "$workspaces"
+assert_contains "queued restart rechecks the current generation" \
+  'restartGeneration === root.firefoxGeneration' "$workspaces"
+assert_contains "queued restart rechecks popup applicability" \
+  'root.firefoxRestartPending && root.firefoxApplicable && wsMenu.open' "$workspaces"
+assert_contains "refresh cannot start while popup is closed" \
+  'if (!wsMenu.open || !root.firefoxApplicable || firefoxTabsProc.running) return' "$workspaces"
+assert_multiline "popup initializes loading before open and launches after open" \
+  $'  function showWsMenu(item, w) {\n    wsMenu.targetWs = w\n    wsMenu.anchorItem = item\n    root.prepareTmuxRefresh()\n    root.prepareFirefoxRefresh(w)\n    wsMenu.open = true\n    root.startTmuxRefresh()\n    root.startFirefoxRefresh()\n  }' "$workspaces"
+assert_multiline "terminating Firefox work remains pending until callbacks drain" \
+  $'    if (firefoxTabsProc.running) {\n      root.firefoxRestartPending = root.firefoxApplicable\n      firefoxTabsProc.running = false\n      return\n    }\n    root.firefoxRestartPending = false' "$workspaces"
+assert_contains "loading combines tmux and Firefox" \
+  'readonly property bool menuLoading: root.tmuxLoading || root.firefoxLoading' "$workspaces"
+assert_contains "rows hide every partial snapshot" \
+  'if (ws.menuLoading) return []' "$menu"
+assert_contains "loading text uses the unified state" \
+  'text: card.ws.menuLoading ? "loading..." : "no windows"' "$menu"
+assert_not_contains "browser snapshot has no legacy bar.run spelling" \
+  'bar.run("omarchy-firefox-bridge tabs' "$workspaces"
+
+assert_multiline "native focus helper owns the workspace fallback" \
+  $'  function focusToplevel(toplevel, workspaceId) {\n    if (toplevel && toplevel.wayland && typeof toplevel.wayland.activate === "function")\n      toplevel.wayland.activate()\n    else root.focusWorkspace(workspaceId)\n  }' "$workspaces"
+assert_contains "activation command is an argv vector" \
+  'firefoxActivateProc.command = ["/usr/bin/env", root.firefoxBridgePath, "activate", String(windowId), String(tabId)]' "$workspaces"
+assert_count "activation argv is assigned exactly once" 1 \
+  'firefoxActivateProc.command = ["/usr/bin/env", root.firefoxBridgePath, "activate", String(windowId), String(tabId)]' "$workspaces"
+assert_count "tabs and activation are the only bridge path consumers" 2 \
+  'root.firefoxBridgePath' "$workspaces"
+assert_count "activation process is declared exactly once" 1 \
+  'id: firefoxActivateProc' "$workspaces"
+assert_multiline "activation process has one unconditional completion path" \
+  $'  Process {\n    id: firefoxActivateProc\n    command: []\n    // qmllint disable signal-handler-parameters\n    onExited: function(exitCode) { root.finishFirefoxActivation(exitCode) }\n    // qmllint enable signal-handler-parameters\n    onRunningChanged: {\n      if (!firefoxActivateProc.running && root.firefoxActivating)\n        root.finishFirefoxActivation(-1)\n    }\n  }' "$workspaces"
+assert_multiline "failed activation start reuses the guarded finish path" \
+  $'    onExited: function(exitCode) { root.finishFirefoxActivation(exitCode) }\n    // qmllint enable signal-handler-parameters\n    onRunningChanged: {\n      if (!firefoxActivateProc.running && root.firefoxActivating)\n        root.finishFirefoxActivation(-1)\n    }\n  }' "$workspaces"
+assert_multiline "invalid IDs focus and close synchronously before launch" \
+  $'    if (!Number.isInteger(windowId) || windowId <= 0 || windowId > 9007199254740991\n        || !Number.isInteger(tabId) || tabId <= 0 || tabId > 9007199254740991) {\n      root.focusToplevel(toplevel, workspaceId)\n      if (wsMenu.open && wsMenu.targetId === workspaceId) wsMenu.close()\n      return\n    }' "$workspaces"
+assert_multiline "unsafe activation IDs return before argv assignment" \
+  $'    if (!Number.isInteger(windowId) || windowId <= 0 || windowId > 9007199254740991\n        || !Number.isInteger(tabId) || tabId <= 0 || tabId > 9007199254740991) {\n      root.focusToplevel(toplevel, workspaceId)\n      if (wsMenu.open && wsMenu.targetId === workspaceId) wsMenu.close()\n      return\n    }\n    if (root.firefoxActivating || firefoxActivateProc.running) return' "$workspaces"
+assert_multiline "one-flight guard precedes all activation origin writes" \
+  $'    if (root.firefoxActivating || firefoxActivateProc.running) return\n\n    root.firefoxActivating = true\n    root.firefoxActivationTop = toplevel\n    root.firefoxActivationWorkspaceId = workspaceId\n    root.firefoxActivationGeneration = root.firefoxGeneration\n    firefoxActivateProc.command = ["/usr/bin/env", root.firefoxBridgePath, "activate", String(windowId), String(tabId)]\n    firefoxActivateProc.running = true' "$workspaces"
+assert_multiline "activation finish ignores every duplicate callback" \
+  $'  function finishFirefoxActivation(exitCode) {\n    if (!root.firefoxActivating) return\n\n    var toplevel = root.firefoxActivationTop' "$workspaces"
+assert_multiline "completion always focuses then closes only its exact popup generation" \
+  $'  function finishFirefoxActivation(exitCode) {\n    if (!root.firefoxActivating) return\n\n    var toplevel = root.firefoxActivationTop\n    var workspaceId = root.firefoxActivationWorkspaceId\n    var activationGeneration = root.firefoxActivationGeneration\n    root.firefoxActivating = false\n    root.firefoxActivationTop = null\n    root.firefoxActivationWorkspaceId = -1\n    root.firefoxActivationGeneration = -1\n\n    root.focusToplevel(toplevel, workspaceId)\n    if (wsMenu.open && root.firefoxGeneration === activationGeneration\n        && wsMenu.targetId === workspaceId) wsMenu.close()\n  }' "$workspaces"
+assert_not_matches "activation completion never branches on exit status" \
+  'exitCode[[:space:]]*(===?|!==?)|switch[[:space:]]*\([[:space:]]*exitCode' "$workspaces"
+assert_not_matches "activation never uses a shell-backed Process" \
+  '(command[[:space:]]*:|firefoxActivateProc\.command[[:space:]]*=)[^\n]*"(/bin/)?(ba)?sh"' "$workspaces"
+assert_not_matches "activation never uses an executable-agnostic -c command" \
+  '(command[[:space:]]*:|firefoxActivateProc\.command[[:space:]]*=)[^\n]*"-c"' "$workspaces"
+assert_not_matches "activation never uses bar.run" \
+  'bar\.run\([^\n]*(firefox|activate|displayUrl|xdg-open)' "$workspaces"
+assert_not_matches "menu never delegates activation to bar.run" \
+  'bar\.run\(' "$menu"
+assert_not_contains "menu declares no helper Process" \
+  'Process {' "$menu"
+assert_not_matches "tab activation never consumes a display URL" \
+  'activateFirefoxTab\([^)]*displayUrl|firefoxActivateProc\.command[^\n]*displayUrl' "$menu"
+assert_not_matches "menu activation never opens a URL" \
+  'xdg-open|Qt\.openUrlExternally' "$menu"
+assert_not_matches "workspace activation never opens a URL" \
+  'xdg-open|Qt\.openUrlExternally' "$workspaces"
+assert_contains "activation wait disables every actionable row" \
+  'enabled: !rowRect.isDiv && !card.ws.firefoxActivating' "$menu"
+assert_multiline "row clicks preserve tmux and bare focus around Firefox activation" \
+  $'            onClicked: {\n              if (rowRect.isTmux) {\n                card.ws.focusTmuxWindow(rowRect.modelData.win.session, rowRect.modelData.win.idx, card.targetId)\n                card.close()\n                return\n              }\n              if (rowRect.isFirefox) {\n                card.ws.activateFirefoxTab(rowRect.modelData.windowId, rowRect.modelData.tab.tabId,\n                                           rowRect.modelData.top, card.targetId)\n                return\n              }\n              card.ws.focusToplevel(rowRect.modelData.top, card.targetId)\n              card.close()\n            }' "$menu"
+
+assert_contains "menu imports controls for its scrollbar" \
+  'import QtQuick.Controls' "$menu"
+assert_contains "menu calls pure Firefox correlation" \
+  'WorkspaceMenuModel.correlateFirefox(nativeWindows, ws.firefoxTabs)' "$menu"
+assert_multiline "native collection failures preserve already-built tmux rows" \
+  $'      try {\n        var collection = card.targetWs.toplevels\n        toplevels = collection ? collection.values : null\n        if (!toplevels || typeof toplevels.length !== "number") return out\n        toplevelCount = toplevels.length\n        if (!isFinite(toplevelCount) || Math.floor(toplevelCount) !== toplevelCount\n            || toplevelCount < 0) return out\n      } catch (error) {\n        return out\n      }' "$menu"
+assert_multiline "malformed native descriptors disable all Firefox correlation" \
+  $'        } catch (error) {\n          nativeEvidenceComplete = false\n        }\n      }\n\n      var correlations = nativeEvidenceComplete\n        ? WorkspaceMenuModel.correlateFirefox(nativeWindows, ws.firefoxTabs)\n        : Object.create(null)' "$menu"
+assert_multiline "Repeater row model contains unexpected property failures" \
+  $'  function rows() {\n    var out = []\n    try {' "$menu"
+assert_multiline "Repeater row model returns safely from its outer boundary" \
+  $'      return out.concat(expanded)\n    } catch (error) {\n      return out\n    }\n  }' "$menu"
+assert_contains "matched toplevel becomes tab rows" \
+  'kind: "firefox-tab"' "$menu"
+assert_multiline "Firefox delegate height is exactly 42px" \
+  $'          readonly property bool isFirefox: modelData.kind === "firefox-tab"\n          readonly property bool isActiveFirefox: isFirefox && modelData.tab.active === true\n\n          width: col.width\n          implicitHeight: isDiv ? Style.space(9)\n            : (isFirefox ? Style.space(42) : rowText.implicitHeight + Style.space(12))' "$menu"
+assert_multiline "favicon slot is exactly 18px square" \
+  $'          Item {\n            id: faviconSlot\n            visible: rowRect.isFirefox\n            anchors.left: parent.left\n            anchors.leftMargin: Style.space(8)\n            anchors.verticalCenter: parent.verticalCenter\n            width: Style.space(18)\n            height: Style.space(18)' "$menu"
+assert_contains "missing favicon uses the packaged local icon" \
+  'Qt.resolvedUrl("assets/firefox.png")' "$menu"
+assert_regex_count "menu has exactly two semantic source sinks" 2 \
+  '(^|[^[:alnum:]_])(source[[:space:]]*:|[[:alnum:]_]+[[:space:]]*\.[[:space:]]*source[[:space:]]*=)' "$menu"
+assert_not_matches "menu has no bracket-property source writes" \
+  $'[[:alnum:]_.]+[[:space:]]*\\[[[:space:]]*["\047]source["\047][[:space:]]*\\][[:space:]]*=' "$menu"
+assert_count "packaged fallback source binding is unique" 1 \
+  'source: card.firefoxFallbackIcon' "$menu"
+assert_multiline "fallback Image uses the packaged icon binding" \
+  $'            Image {\n              anchors.fill: parent\n              source: card.firefoxFallbackIcon\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio' "$menu"
+assert_count "whitelisted dynamic favicon binding is unique" 1 \
+  'WorkspaceMenuModel.safeFavicon(rowRect.modelData.tab.favicon)' "$menu"
+assert_multiline "favicon Image uses only the pure whitelist output" \
+  $'            Image {\n              id: faviconImage\n              anchors.fill: parent\n              source: rowRect.isFirefox\n                ? WorkspaceMenuModel.safeFavicon(rowRect.modelData.tab.favicon) : ""' "$menu"
+assert_multiline "fallback and validated favicon visibility are complementary" \
+  $'            Image {\n              anchors.fill: parent\n              source: card.firefoxFallbackIcon\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              smooth: true\n              visible: faviconImage.status !== Image.Ready\n            }\n\n            Image {\n              id: faviconImage\n              anchors.fill: parent\n              source: rowRect.isFirefox\n                ? WorkspaceMenuModel.safeFavicon(rowRect.modelData.tab.favicon) : ""\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              asynchronous: true\n              smooth: true\n              visible: status === Image.Ready\n            }' "$menu"
+assert_not_contains "fallback icon never uses a remote URL" \
+  'https://icons' "$menu"
+assert_count "bare label, tab title, and tab URL each elide" \
+  3 'elide: Text.ElideRight' "$menu"
+assert_count "every browser-derived text path is forced plain" \
+  3 'textFormat: Text.PlainText' "$menu"
+assert_multiline "bare native label is forced plain before elision" \
+  $'            text: rowRect.isTmux\n              ? rowRect.modelData.win.idx\n                + (rowRect.modelData.win.bell ? card.ws.bellGlyph : (rowRect.modelData.win.star ? "✳" : ""))\n                + (rowRect.modelData.win.name ? "·" + rowRect.modelData.win.name : "")\n              : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                + rowRect.modelData.cls\n                + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")\n            textFormat: Text.PlainText\n            color:' "$menu"
+assert_multiline "Firefox title is forced plain and remains first" \
+  $'            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              font.family: Style.font.family\n              font.pixelSize: Style.font.body\n              font.bold: rowRect.isActiveFirefox\n              elide: Text.ElideRight\n              wrapMode: Text.NoWrap\n              renderType: Text.NativeRendering\n            }\n\n            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText' "$menu"
+assert_multiline "Firefox display URL is forced plain before elision" \
+  $'              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              opacity: 0.55\n              font.family: card.ws.nerdFamily\n              font.pixelSize: Style.font.caption\n              elide: Text.ElideRight' "$menu"
+assert_multiline "tmux rows precede native expansion" \
+  $'      for (var i = 0; i < tmuxRows.length; i++)\n        out.push({kind: "tmux", win: tmuxRows[i]})\n\n      var bareRows = []' "$menu"
+assert_multiline "native matches expand in place in native order" \
+  $'      var expanded = []\n      for (var k = 0; k < bareRows.length; k++) {\n        var bare = bareRows[k]\n        var match = correlations[bare.key]\n        if (!match) {\n          expanded.push(bare)\n          continue\n        }\n        for (var tabIndex = 0; tabIndex < match.tabs.length; tabIndex++) {\n          expanded.push({\n            kind: "firefox-tab",\n            tab: match.tabs[tabIndex],\n            windowId: match.windowId,\n            top: bare.top\n          })\n        }\n      }\n\n      if (tmuxRows.length && expanded.length) out.push({kind: "div"})\n      return out.concat(expanded)' "$menu"
+assert_multiline "active Firefox fill persists without hover" \
+  $'          color: !isDiv && rowArea.containsMouse\n            ? Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.14)\n            : (isActiveFirefox\n              ? Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.08)\n              : "transparent")' "$menu"
+assert_contains "active Firefox title has non-color emphasis" \
+  'font.bold: rowRect.isActiveFirefox' "$menu"
+assert_multiline "Flickable content height tracks the rendered column" \
+  $'  Flickable {\n    id: menuFlick\n    width: parent.width\n    height: parent.height\n    contentWidth: width\n    contentHeight: col.implicitHeight\n    clip: true\n    boundsBehavior: Flickable.StopAtBounds\n    flickableDirection: Flickable.VerticalFlick' "$menu"
+assert_multiline "Flickable owns the column and as-needed scrollbar" \
+  $'    interactive: contentHeight > height\n    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }\n\n    Column {\n      id: col\n      width: menuFlick.width' "$menu"
+assert_multiline "popup cap remains tied to the rendered column" \
+  $'  triggerMode: "click"\n  contentWidth: fittedContentWidth(Math.max(Style.space(220), col.implicitWidth + padding * 2))\n  contentHeight: fittedContentHeight(col.implicitHeight, Style.space(560))' "$menu"
+if [[ -f $firefox_icon && ! -L $firefox_icon && -s $firefox_icon ]]; then
+  pass "packaged Firefox fallback is a regular nonempty file"
+else
+  fail "packaged Firefox fallback is a regular nonempty file"
+  if [[ -e $firefox_icon || -L $firefox_icon ]]; then
+    printf '       actual: %s\n' "$(stat -c 'type=%F size=%s bytes' -- "$firefox_icon" 2>/dev/null)"
+  else
+    printf '       missing: %s\n' "$firefox_icon"
+  fi
+fi
+firefox_icon_decode=$(/usr/bin/magick "$firefox_icon" -regard-warnings \
+  -format '%m %wx%h' -write info: null: 2>&1)
+firefox_icon_decode_status=$?
+if (( firefox_icon_decode_status == 0 )) && [[ $firefox_icon_decode == "PNG 32x32" ]]; then
+  pass "packaged Firefox fallback fully decodes as PNG 32x32"
+else
+  fail "packaged Firefox fallback fully decodes as PNG 32x32"
+  printf '       expected: exit=0 output=PNG 32x32\n'
+  printf '       actual: exit=%s output=%s\n' \
+    "$firefox_icon_decode_status" "$firefox_icon_decode"
+fi
+firefox_icon_mode=$(stat -c '%a' -- "$firefox_icon" 2>&1)
+if [[ $firefox_icon_mode == 644 ]]; then
+  pass "packaged Firefox fallback mode is 0644"
+else
+  fail "packaged Firefox fallback mode is 0644"
+  printf '       expected mode: 644\n'
+  printf '       actual mode: %s\n' "$firefox_icon_mode"
+fi
+
+if (( fails > 0 )); then
+  printf '%d workspace-menu contract failure(s)\n' "$fails"
+  exit 1
+fi
+printf 'ALL OK\n'

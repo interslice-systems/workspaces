@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# ws-open — route an http(s) URL to the Firefox window on the workspace of the
+# tmux session it came from, into a tab group named and coloured after that
+# session.
+#
+# Called by the ws-browser adapter registered through ws-open.desktop.
+# It is inert on a machine whose mimeapps.list does not point at it.
+#
+# ONE RULE. A URL routes if and only if it can be traced to a LOCAL tmux
+# session; the session name is the group name and its window's workspace is
+# the destination. Anything with no session — a desktop launcher, a web-app
+# shortcut, a link from a GUI app — falls through to plain Firefox. There is
+# no "wherever the user is looking" guess: that is what made every new
+# launcher an edge case.
+#
+# TWO FAILURE CLASSES, DELIBERATELY DISTINCT. A *routing* failure is a silent
+# fall-through to plain Firefox. A *launch* failure is a real non-zero exit,
+# preserved by exec. A URL handler that silently fails to open a link is worse
+# than one that opens it in the wrong place.
+#
+# NEVER call xdg-open from here: this script IS the https handler, so that
+# would recurse. Firefox is invoked by absolute path, hardcoded below to
+# /usr/bin/firefox -- a distro-standard passthrough to the real binary on
+# every machine this file reaches, not a nexus-specific location (overridable
+# via WS_OPEN_FIREFOX, used by the test suite). An absolute path is the
+# security property that matters here; a path change on another box is
+# additionally contained by the same inert-without-mimeapps property noted
+# above: nothing runs this script unless a machine's mimeapps.list says to.
+#
+# hyprctl/jq/tmux/tmux-local-clients resolve through the inherited PATH,
+# uncontrolled, deliberately: this is a same-UID threat model, so a PATH
+# substitution attack grants no authority an attacker didn't already have by
+# virtue of running code as this user. See the design doc's Security section.
+set -uo pipefail
+# shellcheck source=/dev/null
+source "${WS_BROWSER_LIB:-$HOME/.local/lib/ws-browser-lib.bash}" || exit 70
+
+FIREFOX="${WS_OPEN_FIREFOX:-/usr/bin/firefox}"
+PATH="${PATH:-/usr/bin:/bin}"
+PROC_ROOT="${WS_OPEN_PROC_ROOT:-/proc}"
+
+url="${1:-}"
+
+# Validate BEFORE anything else. A URL that fails validation reaches neither
+# the router nor the fallback: passing it to the fallback would reintroduce the
+# argument injection this check exists to prevent (a URL beginning with "-"
+# becoming a Firefox flag).
+ws_browser_valid_url "$@" || { ws_browser_log route-invalid-url; exit 64; }
+
+fallback() { ws_browser_log "$1"; ws_browser_exec "$FIREFOX" "$url"; }
+
+command -v hyprctl >/dev/null 2>&1 || fallback fallback-missing-hyprctl
+command -v jq      >/dev/null 2>&1 || fallback fallback-missing-jq
+command -v tmux    >/dev/null 2>&1 || fallback fallback-missing-tmux
+
+# --- resolve the tmux session this URL belongs to ---------------------------
+# Two probes see two halves of the process tree. TMUX_PANE flows down into
+# every program running in a pane, so a process that opens a URL carries it.
+# A terminal's click-to-open launcher does NOT: the terminal spawns xdg-open
+# itself, as a sibling of the tmux subtree, with no tmux environment at all.
+# For that case walk this process's ancestry up to the terminal window and ask
+# which session is attached inside it. Both probes end at a tmux-local-clients
+# record — one window, one session, one workspace — so the destination is the
+# same kind of fact either way. Terminal-agnostic by construction: every
+# emulator spawns its URL launcher as its own child, and Hyprland reports the
+# emulator's pid on the window.
+locals="$(tmux-local-clients 2>/dev/null)" || fallback fallback-local-clients
+
+# Ancestor pids of this process, nearest first, as a JSON array. Same walk as
+# tmux-local-clients, in the other direction. Bounded; a truncated walk just
+# fails to match, which is a fall-through.
+ancestors() {
+  local pid=$$ stat ppid out="" depth
+  for ((depth = 0; depth < 12; depth++)); do
+    stat="$(< "$PROC_ROOT/$pid/stat")" 2>/dev/null || break
+    stat="${stat##*') '}"
+    # shellcheck disable=SC2086
+    set -- $stat
+    ppid="${2:-}"
+    { [[ $ppid =~ ^[0-9]+$ ]] && (( ppid > 1 )); } || break
+    out+="${out:+,}$ppid"
+    pid="$ppid"
+  done
+  printf '[%s]' "$out"
+}
+
+record=""
+if [[ -n ${TMUX_PANE:-} ]]; then
+  ws_browser_log route-origin-pane
+  session="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)" || fallback fallback-tmux-session
+  [[ -n $session ]] || fallback fallback-tmux-session
+
+  # Exactly one distinct LOCAL workspace for this session, or decline.
+  record="$(jq -ec --arg s "$session" '
+      [ .[] | select(.session == $s) ]
+      | if (map(.workspace.id) | unique | length) == 1 then .[0] else empty end
+    ' <<<"$locals" 2>/dev/null)" || fallback fallback-local-workspace
+
+  # ...and the freshest client on the session must be one of the local ones.
+  # A pane is one pty shared by every attached client, so "has a local client"
+  # answers yes even when the person typing is on a phone. client_activity
+  # tracks input, so the freshest client is the one that just typed.
+  local_activity="$(jq -er --arg s "$session" '
+      [ .[] | select(.session == $s) | .activity ] | max
+      | if type == "number" then . else empty end
+    ' <<<"$locals" 2>/dev/null)" || fallback fallback-client-activity
+  overall_activity=0
+  while IFS=$'\t' read -r client_session client_activity; do
+    [[ $client_session == "$session" ]] || continue
+    [[ $client_activity =~ ^[0-9]+$ ]] || continue
+    (( client_activity > overall_activity )) && overall_activity=$client_activity
+  done < <(tmux list-clients -F "#{session_name}"$'\t'"#{client_activity}" 2>/dev/null)
+  (( overall_activity > 0 )) || fallback fallback-client-activity
+  (( local_activity >= overall_activity )) || fallback fallback-remote-client
+else
+  ws_browser_log route-origin-window
+  # The click itself is the evidence that the user is at this window, so no
+  # activity test here: a URL picked in a terminal's URL mode never reaches
+  # tmux as input, and a phone that typed a minute ago must not veto it.
+  record="$(jq -ec --argjson a "$(ancestors)" '
+      [ .[] | select((.pid | type) == "number") | select(.pid as $p | $a | index($p) != null) ]
+      | if length == 1 then .[0] else empty end
+    ' <<<"$locals" 2>/dev/null)" || fallback fallback-no-session
+fi
+
+session="$(jq -er '.session | strings' <<<"$record" 2>/dev/null)" || fallback fallback-workspace-lookup
+ws_id="$(jq -er '.workspace.id | numbers' <<<"$record" 2>/dev/null)" || fallback fallback-workspace-lookup
+ws_name="$(jq -er '.workspace.name | strings' <<<"$record" 2>/dev/null)" || fallback fallback-workspace-lookup
+[[ $ws_id =~ ^-?[0-9]+$ ]] || fallback fallback-workspace-lookup
+
+# Special workspaces sit outside the normal switching set, and this box keeps a
+# long-lived media window on special:scratchpad. Links do not belong there.
+[[ $ws_name != special:* ]] || fallback fallback-special-workspace
+(( ws_id > 0 )) || fallback fallback-special-workspace
+
+# --- find the one Firefox toplevel on that workspace ------------------------
+# Emits "0", "N" for N>1, or "1<TAB>address<TAB>title". Non-zero exit only when
+# hyprctl or jq itself fails — an empty or ambiguous workspace is a successful
+# answer, not an error, because the three cases need different handling.
+read_toplevel() {
+  hyprctl clients -j 2>/dev/null | jq -er --argjson id "$ws_id" '
+    [ .[] | select(.class == "firefox" and .workspace.id == $id) ] as $ff
+    | if ($ff | length) == 1
+      then "1\t\($ff[0].address)\t\($ff[0].title)"
+      else "\($ff | length)" end'
+}
+
+toplevel="$(read_toplevel)" || fallback fallback-window-query
+count="${toplevel%%$'\t'*}"
+
+if [[ $count == 0 ]]; then
+  # A new window lands on whatever workspace is active, so create one only
+  # while the user is looking at the target; otherwise behave as today.
+  active_id="$(hyprctl activeworkspace -j 2>/dev/null | jq -er '.id | numbers')" || fallback fallback-active-workspace
+  [[ $active_id == "$ws_id" ]] || fallback fallback-target-inactive
+  ws_browser_log route-new-window
+  ws_browser_exec "$FIREFOX" --new-window "$url"
+elif [[ $count != 1 ]]; then
+  fallback fallback-multiple-windows
+fi
+
+rest="${toplevel#*$'\t'}"
+title="${rest#*$'\t'}"
+
+# --- group name and colour --------------------------------------------------
+# The group is named after the SESSION — the identity — which ws-attach also
+# writes onto the workspace, so the two normally agree; the session is the
+# authority when they don't (a workspace renamed by hand, say).
+#
+# The bridge bounds group.title at 64 code points and rejects the whole
+# request when it is longer, and nothing upstream truncates a session name
+# to fit. A correctly named group in an arbitrary colour is a better outcome
+# than no group (see the design doc); the same logic applies one step further
+# up: the URL still routing, ungrouped, is a better outcome than an
+# over-long name silently killing routing for that session forever.
+group_args=()
+if (( ${#session} <= 64 )); then
+  group_args=(--group "$session")
+  # shellcheck source=/dev/null
+  if source "$HOME/.local/lib/workspace-identity-lib" 2>/dev/null \
+    && color="$(wsid_ff_color "$ws_id" "$session" 2>/dev/null)" \
+    && [[ -n $color ]]; then
+    group_args+=(--color "$color")
+  else
+    ws_browser_log group-color-unavailable
+  fi
+else
+  ws_browser_log group-name-too-long
+fi
+
+# --- recheck, then dispatch -------------------------------------------------
+# Narrows a real TOCTOU misroute: a Firefox window moved to another workspace
+# between inspection and dispatch would otherwise receive someone else's tab.
+# There is no atomic operation spanning Hyprland and Firefox, so this narrows
+# the window rather than closing it.
+recheck="$(read_toplevel)" || fallback fallback-window-query
+[[ $recheck == "$toplevel" ]] || fallback fallback-window-changed
+
+command -v omarchy-firefox-bridge >/dev/null 2>&1 || fallback fallback-bridge-unavailable
+if ! bridge_result="$(omarchy-firefox-bridge open \
+  --toplevel-title "$title" --url "$url" "${group_args[@]}" 2>/dev/null)"; then
+  # Parse only the known enum. Never pass raw stdout/stderr to the logger.
+  bridge_error="$(jq -er '.error | strings' <<<"$bridge_result" 2>/dev/null)" || bridge_error=bridge-error
+  case "$bridge_error" in
+    unavailable|timeout|no-window|ambiguous-window|invalid-request|create-failed)
+      fallback "fallback-bridge-$bridge_error" ;;
+    *) fallback fallback-bridge-error ;;
+  esac
+fi
+if (( ${#group_args[@]} > 0 )); then
+  # The bridge acknowledges tab creation before asynchronous grouping finishes.
+  ws_browser_log route-opened-group-requested
+else
+  ws_browser_log route-opened-ungrouped
+fi
+exit 0

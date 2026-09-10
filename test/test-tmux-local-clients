@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for the shared tmux-to-Hyprland resolver.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBJECT="${TMUX_LOCAL_CLIENTS:-$here/../bin/tmux-local-clients}"
+fails=0
+
+fail() {
+  printf 'FAIL - %s\n' "$1"
+  fails=$((fails + 1))
+}
+
+pass() {
+  printf 'ok   - %s\n' "$1"
+}
+
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ $actual == "$expected" ]]; then
+    pass "$name"
+  else
+    fail "$name"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$expected" "$actual"
+  fi
+}
+
+assert_json() {
+  local name=$1 expected=$2
+  if jq -e --argjson expected "$expected" '. == $expected' "$TMPD/stdout" >/dev/null 2>&1; then
+    pass "$name"
+  else
+    fail "$name"
+    printf '       expected: %s\n       actual:   %s\n' "$expected" "$(< "$TMPD/stdout")"
+  fi
+}
+
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+mkdir -p "$TMPD/bin" "$TMPD/proc"
+
+cat > "$TMPD/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/tmux.calls"
+[[ $* == "list-clients -F #{session_name}"$'\t'"#{client_pid}"$'\t'"#{client_activity}" ]] || exit 64
+[[ ! -s $STUB_DIR/tmux.err ]] || cat "$STUB_DIR/tmux.err" >&2
+if [[ -s $STUB_DIR/tmux.out ]]; then
+  if [[ ${TERM:-dumb} == dumb && ${LC_ALL:-} == C ]]; then
+    tr '\t' '_' < "$STUB_DIR/tmux.out"
+  else
+    cat "$STUB_DIR/tmux.out"
+  fi
+fi
+exit "$(< "$STUB_DIR/tmux.status")"
+STUB
+
+cat > "$TMPD/bin/hyprctl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/hyprctl.calls"
+[[ $* == "clients -j" ]] || exit 64
+[[ ! -s $STUB_DIR/hypr.err ]] || cat "$STUB_DIR/hypr.err" >&2
+[[ ! -s $STUB_DIR/hypr.json ]] || cat "$STUB_DIR/hypr.json"
+exit "$(< "$STUB_DIR/hypr.status")"
+STUB
+chmod +x "$TMPD/bin/tmux" "$TMPD/bin/hyprctl"
+export STUB_DIR="$TMPD" PATH="$TMPD/bin:$PATH"
+export TMUX_LOCAL_CLIENTS_PROC_ROOT="$TMPD/proc"
+
+reset_case() {
+  rm -rf "$TMPD/proc"
+  mkdir -p "$TMPD/proc"
+  : > "$TMPD/tmux.out"
+  : > "$TMPD/tmux.err"
+  : > "$TMPD/hypr.err"
+  : > "$TMPD/tmux.calls"
+  : > "$TMPD/hyprctl.calls"
+  printf '0\n' > "$TMPD/tmux.status"
+  printf '0\n' > "$TMPD/hypr.status"
+  printf '[]\n' > "$TMPD/hypr.json"
+}
+
+write_stat() {
+  local pid=$1 comm=$2 ppid=$3
+  mkdir -p "$TMPD/proc/$pid"
+  printf '%s (%s) S %s 0 0 0\n' "$pid" "$comm" "$ppid" > "$TMPD/proc/$pid/stat"
+}
+
+run_subject() {
+  "$SUBJECT" > "$TMPD/stdout" 2> "$TMPD/stderr"
+  subject_status=$?
+}
+
+# Kitty: tmux client -> login shell -> terminal, including tricky comm values.
+reset_case
+write_stat 300 'tmux: client (worker)' 200
+write_stat 200 'bash (login)' 100
+write_stat 100 'kitty' 1
+printf 'oracle\t300\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xaaa","pid":100,"class":"kitty","workspace":{"id":3,"name":"oracle"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'Kitty ancestry exits successfully' 0 "$subject_status"
+assert_json 'resolves Kitty ancestry with spaces and parentheses in comm' '[{"session":"oracle","activity":1,"address":"0xaaa","pid":100,"workspace":{"id":3,"name":"oracle"},"class":"kitty","focusHistoryID":0}]'
+
+# tmux sanitizes control separators under a byte-only locale when invoked by a
+# headless systemd unit (TERM=dumb). The resolver must retain its tab records.
+reset_case
+write_stat 305 'tmux: client' 105
+write_stat 105 'kitty' 1
+printf 'headless\t305\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xaab","pid":105,"class":"kitty","workspace":{"id":3,"name":"headless"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+TERM=dumb run_subject
+assert_json 'resolves ancestry from a headless systemd environment' '[{"session":"headless","activity":1,"address":"0xaab","pid":105,"workspace":{"id":3,"name":"headless"},"class":"kitty","focusHistoryID":0}]'
+
+# foot: tmux client is a direct child of the terminal.
+reset_case
+write_stat 310 'tmux: client' 110
+write_stat 110 'foot' 1
+printf 'foot-work\t310\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xbbb","pid":110,"class":"foot","workspace":{"id":4,"name":"foot-work"},"focusHistoryID":2}]' > "$TMPD/hypr.json"
+run_subject
+assert_json 'resolves foot direct-child ancestry' '[{"session":"foot-work","activity":1,"address":"0xbbb","pid":110,"workspace":{"id":4,"name":"foot-work"},"class":"foot","focusHistoryID":2}]'
+
+# Ghostty: tmux client -> shell -> surface process represented by Hyprland.
+reset_case
+write_stat 320 'tmux: client' 220
+write_stat 220 'fish (interactive)' 120
+write_stat 120 'ghostty-surface' 1
+printf 'ghost-work\t320\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xccc","pid":120,"class":"com.mitchellh.ghostty","workspace":{"id":5,"name":"ghost-work"},"focusHistoryID":3}]' > "$TMPD/hypr.json"
+run_subject
+assert_json 'resolves Ghostty surface ancestry' '[{"session":"ghost-work","activity":1,"address":"0xccc","pid":120,"workspace":{"id":5,"name":"ghost-work"},"class":"com.mitchellh.ghostty","focusHistoryID":3}]'
+
+# Fractional JSON numbers are not valid process, workspace, or focus identifiers.
+for field in pid workspace focus; do
+  reset_case
+  write_stat 330 'tmux: client' 130
+  write_stat 130 'kitty' 1
+  printf 'fractional\t330\t1\n' > "$TMPD/tmux.out"
+  case "$field" in
+    pid) json='[{"address":"0xf01","pid":130.5,"class":"kitty","workspace":{"id":5,"name":"fractional"},"focusHistoryID":0}]' ;;
+    workspace) json='[{"address":"0xf02","pid":130,"class":"kitty","workspace":{"id":5.5,"name":"fractional"},"focusHistoryID":0}]' ;;
+    focus) json='[{"address":"0xf03","pid":130,"class":"kitty","workspace":{"id":5,"name":"fractional"},"focusHistoryID":0.5}]' ;;
+  esac
+  printf '%s\n' "$json" > "$TMPD/hypr.json"
+  run_subject
+  assert_json "omits fractional $field identifier" '[]'
+done
+
+# A remote mosh client has no ancestor represented by local Hyprland.
+reset_case
+write_stat 400 'tmux: client' 401
+write_stat 401 'sshd: chris@pts/2' 402
+write_stat 402 'mosh-server (new)' 1
+printf 'remote\t400\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xddd","pid":999,"class":"kitty","workspace":{"id":6,"name":"local"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'remote ancestry exits successfully' 0 "$subject_status"
+assert_json 'omits remote mosh ancestry' '[]'
+assert_eq 'remote ancestry stops cleanly before absent PID 1' '' "$(< "$TMPD/stderr")"
+
+# Missing and malformed proc records are skipped, not fatal.
+reset_case
+write_stat 501 'tmux: client' nope
+printf 'missing\t500\t1\nmalformed\t501\t1\ninvalid-pid\tnan\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xeee","pid":100,"class":"kitty","workspace":{"id":7,"name":"local"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'bad proc records are nonfatal' 0 "$subject_status"
+assert_json 'skips missing and malformed proc records' '[]'
+
+# Both known tmux no-server diagnostic forms are normal empty states.
+for diagnostic in \
+  'no server running on /tmp/tmux-1000/default' \
+  'error connecting to /tmp/tmux-1000/default (No such file or directory)'
+do
+  reset_case
+  printf '1\n' > "$TMPD/tmux.status"
+  printf '%s\n' "$diagnostic" > "$TMPD/tmux.err"
+  run_subject
+  assert_eq "no-server status is success: $diagnostic" 0 "$subject_status"
+  assert_json "no-server output is empty JSON: $diagnostic" '[]'
+  assert_eq "no-server diagnostic stays off stderr: $diagnostic" '' "$(< "$TMPD/stderr")"
+done
+
+reset_case
+run_subject
+assert_json 'empty tmux client list returns an empty array' '[]'
+
+reset_case
+printf '2\n' > "$TMPD/tmux.status"
+printf 'permission denied\n' > "$TMPD/tmux.err"
+run_subject
+assert_eq 'hard tmux failure exits nonzero' 1 "$subject_status"
+assert_eq 'hard tmux failure writes no stdout' '' "$(< "$TMPD/stdout")"
+assert_eq 'hard tmux failure is prefixed on stderr' 'tmux-local-clients: tmux list-clients failed: permission denied' "$(< "$TMPD/stderr")"
+assert_eq 'hard tmux failure does not query Hyprland' '' "$(< "$TMPD/hyprctl.calls")"
+
+reset_case
+printf '1\n' > "$TMPD/hypr.status"
+printf 'compositor unavailable\n' > "$TMPD/hypr.err"
+run_subject
+assert_eq 'failed Hyprland query exits nonzero' 1 "$subject_status"
+assert_eq 'failed Hyprland query writes no stdout' '' "$(< "$TMPD/stdout")"
+assert_eq 'failed Hyprland query is prefixed on stderr' 'tmux-local-clients: hyprctl clients failed: compositor unavailable' "$(< "$TMPD/stderr")"
+
+for bad_json in '{not-json' '{"pid":100}'
+do
+  reset_case
+  printf '%s\n' "$bad_json" > "$TMPD/hypr.json"
+  run_subject
+  assert_eq "invalid Hyprland JSON exits nonzero: $bad_json" 1 "$subject_status"
+  assert_eq "invalid Hyprland JSON writes no stdout: $bad_json" '' "$(< "$TMPD/stdout")"
+  assert_eq "invalid Hyprland JSON reports parse failure: $bad_json" 'tmux-local-clients: invalid hyprctl clients JSON' "$(< "$TMPD/stderr")"
+done
+
+# Duplicate records collapse; one address claimed by two sessions is ambiguous.
+reset_case
+write_stat 600 'tmux: client' 100
+write_stat 601 'tmux: client' 100
+write_stat 100 'kitty' 1
+printf 'same\t600\t1\nsame\t600\t1\nother\t601\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0xfff","pid":100,"class":"kitty","workspace":{"id":8,"name":"same"},"focusHistoryID":1}]' > "$TMPD/hypr.json"
+run_subject
+assert_json 'omits an address associated with conflicting sessions' '[]'
+
+reset_case
+write_stat 610 'tmux: client' 110
+write_stat 110 'foot' 1
+printf 'same\t610\t1\nsame\t610\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0x111","pid":110,"class":"foot","workspace":{"id":9,"name":"same"},"focusHistoryID":4}]' > "$TMPD/hypr.json"
+run_subject
+assert_json 'collapses straight duplicate same-session records' '[{"session":"same","activity":1,"address":"0x111","pid":110,"workspace":{"id":9,"name":"same"},"class":"foot","focusHistoryID":4}]'
+
+# Distinct local windows survive and are sorted by session, focus, then address.
+reset_case
+write_stat 700 'tmux: client' 101
+write_stat 701 'tmux: client' 102
+write_stat 702 'tmux: client' 103
+write_stat 703 'tmux: client' 104
+for pid in 101 102 103 104; do write_stat "$pid" terminal 1; done
+printf 'zeta\t700\t1\nalpha\t701\t1\nalpha\t702\t1\nalpha\t703\t1\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0x300","pid":101,"class":"kitty","workspace":{"id":3,"name":"zeta"},"focusHistoryID":0},{"address":"0x200","pid":102,"class":"foot","workspace":{"id":2,"name":"alpha"},"focusHistoryID":5},{"address":"0x100","pid":103,"class":"kitty","workspace":{"id":1,"name":"alpha"},"focusHistoryID":5},{"address":"0x050","pid":104,"class":"ghostty","workspace":{"id":4,"name":"alpha"},"focusHistoryID":1}]' > "$TMPD/hypr.json"
+run_subject
+assert_json 'keeps two local windows and sorts deterministically' '[{"session":"alpha","activity":1,"address":"0x050","pid":104,"workspace":{"id":4,"name":"alpha"},"class":"ghostty","focusHistoryID":1},{"session":"alpha","activity":1,"address":"0x100","pid":103,"workspace":{"id":1,"name":"alpha"},"class":"kitty","focusHistoryID":5},{"session":"alpha","activity":1,"address":"0x200","pid":102,"workspace":{"id":2,"name":"alpha"},"class":"foot","focusHistoryID":5},{"session":"zeta","activity":1,"address":"0x300","pid":101,"workspace":{"id":3,"name":"zeta"},"class":"kitty","focusHistoryID":0}]'
+assert_eq 'successful output leaves stderr empty' '' "$(< "$TMPD/stderr")"
+
+# Two local clients resolving to the same window: activity is the max of the two.
+reset_case
+write_stat 111 'tmux: client' 811
+write_stat 112 'tmux: client' 811
+write_stat 811 'kitty' 1
+printf 'work\t111\t100\nwork\t112\t200\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0x400","pid":811,"class":"kitty","workspace":{"id":10,"name":"work"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'activity is the max across clients on a window' '200' "$(jq -r '.[0].activity' "$TMPD/stdout")"
+
+# Existing fields and ordering are unchanged by the addition.
+reset_case
+write_stat 111 'tmux: client' 811
+write_stat 811 'kitty' 1
+printf 'work\t111\t100\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0x400","pid":811,"class":"kitty","workspace":{"id":10,"name":"work"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'existing fields are unchanged' 'work' "$(jq -r '.[0].session' "$TMPD/stdout")"
+
+# A client whose client_activity is not a run of ASCII digits is skipped entirely.
+reset_case
+write_stat 111 'tmux: client' 811
+write_stat 811 'kitty' 1
+printf 'work\t111\tnonsense\n' > "$TMPD/tmux.out"
+printf '%s\n' '[{"address":"0x400","pid":811,"class":"kitty","workspace":{"id":10,"name":"work"},"focusHistoryID":0}]' > "$TMPD/hypr.json"
+run_subject
+assert_eq 'a client with a non-numeric activity is skipped' '0' "$(jq -r 'length' "$TMPD/stdout")"
+
+printf '\n'
+if [[ $fails -eq 0 ]]; then
+  printf 'ALL OK\n'
+else
+  printf '%s FAILURES\n' "$fails"
+  exit 1
+fi

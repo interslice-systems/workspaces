@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# workspace-identity-lib — colorhash: name -> color, for session names.
+#
+# Replaced the cksum%7 / Okabe-Ito system on 2026-08-21. Two things changed at
+# once, and both are contract-level:
+#
+#   hash     cksum      -> FNV-1a 32-bit over UTF-8 bytes (colorhash contract)
+#   palette  7 hardcoded bins -> the cells array in ~/.config/colorhash/palette.json
+#
+# Every existing session therefore changes color once. That is expected, not a
+# regression: the two hashes are unrelated functions over the same names.
+#
+# The palette is DATA now, not constants in this file. operatord reads the same
+# palette.json (daemon/operatord/hyprland.py), so the pad and the bar agree by
+# reading one file rather than by two copies of a list staying in sync — which
+# is what the old "change both or neither" comment was asking humans to do.
+#
+# FAIL-CLOSED ON COLOR, NEVER ON NAMING. A missing or malformed palette makes the
+# color accessors return failure with no output, so callers keep their plain ANSI
+# rendering — a silent fallback to some other palette would show wrong-but-plausible
+# colors, which is worse than obviously-unstyled ones.
+#
+# But SOURCING still succeeds, and wsid_session_name still works. ws-attach sources
+# this file under `set -euo pipefail` and uses nothing but wsid_session_name; a lib
+# that failed to source would take SUPER+ALT+ENTER — the terminal launcher — down
+# over a missing color file. Naming is load-bearing, color is a recognition aid.
+# Guard with wsid_have_palette before calling any color accessor.
+
+WSID_PALETTE_FILE="${WSID_PALETTE_FILE:-$HOME/.config/colorhash/palette.json}"
+
+# Per-cell surfaces, parallel arrays indexed by cell number.
+#   BG     background fills (the published Petroff hex, verbatim)
+#   TEXT   black/white to write ON that background, by WCAG polarity
+#   FG_D   foreground for DARK themes  (lightened; clears 3:1 on nord #2e3440)
+#   FG_L   foreground for LIGHT themes (darkened;  clears 3:1 on latte #eff1f5)
+#   LED    the WS2812 rendering, for the macropad
+#
+# Petroff's published hexes are FILL colors designed for plots on white. Used
+# directly as terminal foreground they fail 3:1 on 4 of 10 cells against nord and
+# 5 of 10 against latte — hence FG_D/FG_L, which re-lighten each hue into its
+# ground's usable band. Never substitute BG for a foreground role.
+WSID_BG=() WSID_TEXT=() WSID_FG_D=() WSID_FG_L=() WSID_LED=()
+
+wsid_load_palette() {
+  [[ -r "$WSID_PALETTE_FILE" ]] || return 1
+  command -v jq >/dev/null || return 1
+  local bg text fgl fgd led
+  WSID_BG=() WSID_TEXT=() WSID_FG_D=() WSID_FG_L=() WSID_LED=()
+  while IFS=$'\t' read -r bg text fgl fgd led; do
+    [[ -n "$bg" ]] || continue
+    WSID_BG+=("$bg"); WSID_TEXT+=("$text")
+    WSID_FG_L+=("$fgl"); WSID_FG_D+=("$fgd"); WSID_LED+=("$led")
+  done < <(jq -r '.cells[] | [.bg,.bgText,.lightFg,.darkFg,.led] | @tsv' \
+             "$WSID_PALETTE_FILE" 2>/dev/null)
+  (( ${#WSID_BG[@]} > 0 )) || return 1
+}
+# Deliberately not `|| return 1` — see FAIL-CLOSED ON COLOR above. `|| true` keeps
+# the failure out of a sourcing caller's `set -e`.
+wsid_load_palette || true
+
+# wsid_have_palette -> 0 when color accessors will work. Guard on this.
+wsid_have_palette() { (( ${#WSID_BG[@]} > 0 )); }
+
+# wsid_light -> 0 when the current theme is light, 1 otherwise.
+# Omarchy 4 keeps the current theme at ~/.local/state/omarchy/current/theme and marks
+# a light theme with `mode = "light"` in colors.toml; Omarchy 3 used
+# ~/.config/omarchy/current/theme and a light.mode marker file. Both are honoured,
+# state dir first, so the lib reads correctly on either generation (and on thinkpad
+# until it upgrades). WSID_THEME_DIR pins a directory explicitly (tests).
+wsid_theme_dir() {
+  if [[ -n "${WSID_THEME_DIR:-}" ]]; then printf '%s' "$WSID_THEME_DIR"; return; fi
+  local d
+  for d in "$HOME/.local/state/omarchy/current/theme" "$HOME/.config/omarchy/current/theme"; do
+    [[ -d "$d" ]] && { printf '%s' "$d"; return; }
+  done
+  printf '%s' "$HOME/.local/state/omarchy/current/theme"
+}
+wsid_light() {
+  local d; d="$(wsid_theme_dir)"
+  [[ -f "$d/light.mode" ]] && return 0
+  [[ -r "$d/colors.toml" ]] && grep -Eq '^[[:space:]]*mode[[:space:]]*=[[:space:]]*"light"' "$d/colors.toml"
+}
+
+# wsid_rename_workspace <id> <name> -> rename a Hyprland workspace, provider-aware.
+# Quattro's Lua config provider rejects the classic `dispatch renameworkspace <id>
+# <name>` (it is parsed as Lua: "dispatch is a shorthand for hl.dispatch(...)"); it
+# needs hl.dsp.workspace.rename({workspace=<id>, name="<name>"}). Pre-Quattro's .conf
+# provider needs the classic form. `hyprctl systeminfo` reports which. Names are
+# escaped for the Lua string literal. Mirror any change into ws-rename-workspace,
+# which keeps an inline copy (it is fleet-shared and lib-free).
+wsid_rename_workspace() {
+  local id="$1" name="$2" esc
+  if hyprctl systeminfo 2>/dev/null | grep -q 'configProvider: lua'; then
+    esc=${name//\\/\\\\}; esc=${esc//\"/\\\"}
+    hyprctl dispatch "hl.dsp.workspace.rename({workspace = $id, name = \"$esc\"})"
+  else
+    hyprctl dispatch renameworkspace "$id" "$name"
+  fi
+}
+
+# wsid_reject_name <name> [own-workspace-id] -> 0 (and a reason on stdout) when NAME
+# must not become a workspace name; 1 when it is fine. Used by ws-rename (SUPER+ALT+N).
+# ~/.local/bin/ws-rename-workspace carries an INLINE copy of the same three rules on
+# purpose -- it is fleet-shared, lib-free, and runs from a tmux hook where a failed
+# source would silently kill rename propagation. Change one, change both:
+#   - a bare number shadows a workspace id (`hyprctl dispatch workspace 5` reads as
+#     ambiguous even where the compositor disambiguates);
+#   - `special:` is Hyprland's scratchpad namespace;
+#   - a name already held by ANOTHER workspace makes two workspaces fight over one
+#     tmux session, since ws-attach derives the session FROM the workspace name.
+#     Checked only when hyprctl and jq are present and an own id is given.
+wsid_reject_name() {
+  local name="$1" own="${2:-}" clash
+  [[ -n "$name" ]] || { printf 'empty name'; return 0; }
+  [[ "$name" =~ ^[0-9]+$ ]] && { printf "'%s' is a bare number (would shadow a workspace id)" "$name"; return 0; }
+  [[ "$name" == special:* ]] && { printf "'%s' is in the special: namespace" "$name"; return 0; }
+  if [[ -n "$own" ]] && command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    clash="$(hyprctl workspaces -j 2>/dev/null \
+      | jq -r --arg n "$name" --argjson id "$own" '.[] | select(.name == $n and .id != $id) | .id' 2>/dev/null | head -1)"
+    [[ -n "$clash" ]] && { printf "workspace %s is already named '%s'" "$clash" "$name"; return 0; }
+  fi
+  return 1
+}
+
+# wsid_hash <string> -> FNV-1a 32-bit, decimal.
+# The colorhash contract: FNV1a32(UTF8(NFC(name))). ICU normalizes the hash byte
+# stream only; the stored name remains exact. Missing uconv fails closed rather
+# than silently hashing a non-canonical representation.
+wsid_hash() {
+  command -v uconv >/dev/null 2>&1 || return 1
+  local h=2166136261 b fd producer
+  exec {fd}< <(set -o pipefail; {
+    diagnostics="$(printf '%s' "$1" \
+      | uconv -f UTF-8 -t UTF-8 -x any-nfc 2>&1 >&3)"
+    normalizer=$?
+    (( normalizer == 0 )) && [[ -z "$diagnostics" ]]
+  } 3>&1 | od -An -tu1 -v | tr -s ' ' '\n')
+  producer=$!
+  while read -r b <&"$fd"; do
+    [[ -n "$b" ]] || continue
+    h=$(( (h ^ b) & 0xFFFFFFFF ))
+    h=$(( (h * 16777619) & 0xFFFFFFFF ))
+  done
+  exec {fd}<&-
+  wait "$producer" || return 1
+  printf '%s' "$h"
+}
+
+# wsid_cell <id> [label] -> cell index in [0, len(cells))
+# Input cascade: select the label exactly as stored, else the decimal id. NFC
+# normalization happens only at the wsid_hash boundary; the stored label remains
+# unchanged while canonically equivalent names receive the same color.
+wsid_cell() {
+  wsid_have_palette || return 1     # modulo by zero would be a hard bash error
+  local id="$1" label="${2:-}" input hash
+  input="${label:-$id}"
+  hash="$(wsid_hash "$input")" || return 1
+  printf '%s' "$(( hash % ${#WSID_BG[@]} ))"
+}
+
+# wsid_color <id> [label] -> #RRGGBB background fill for this name.
+# Kept as the name every existing caller already uses. Color is a recognition aid
+# keyed to the name, not an identity channel — collisions are fine and expected
+# (at n=10, "oracle", "dotfiles" and "ws-3" all land on the same cell).
+wsid_color() { local i; i="$(wsid_cell "$@")" || return 1; printf '#%s\n' "${WSID_BG[$i]#\#}"; }
+
+# wsid_text <id> [label] -> #RRGGBB to write ON wsid_color's background.
+# Black or white by WCAG polarity, derived by the lab, not chosen here. Three of
+# the ten Petroff cells (#bd1f01, #832db6, #717581) need white; hardcoding black
+# at the call site renders those three unreadable.
+wsid_text() { local i; i="$(wsid_cell "$@")" || return 1; printf '#%s\n' "${WSID_TEXT[$i]#\#}"; }
+
+# wsid_fg <id> [label] -> #RRGGBB foreground for the CURRENT theme's ground.
+wsid_fg() {
+  local i; i="$(wsid_cell "$@")" || return 1
+  if wsid_light; then printf '#%s\n' "${WSID_FG_L[$i]#\#}"
+  else printf '#%s\n' "${WSID_FG_D[$i]#\#}"; fi
+}
+
+# wsid_led <id> [label] -> #RRGGBB for the macropad's WS2812 LEDs.
+wsid_led() { local i; i="$(wsid_cell "$@")" || return 1; printf '#%s\n' "${WSID_LED[$i]#\#}"; }
+
+# wsid_ff_color <id> [label] -> one of Firefox's nine tab group colour names.
+#
+# Firefox will not take a hex value. Its nine tab-group colours are fixed OKLCH
+# hue angles in tokens-shared.css -- blue 260, cyan 205, green 145, yellow 90,
+# orange 50, red 15, pink 360, purple 315, plus an achromatic grey -- so each
+# Petroff cell snaps to the nearest of those hues, chroma ignored. Cells 3 and 8
+# have almost no chroma and go to grey on that basis.
+#
+# Ten cells into nine colours collide by construction: 1/7 yellow, 3/8 grey,
+# 5/6 orange, with green and pink unused. That is deliberate. Resemblance to
+# the workspace pill is what the colour is for; separation is the group NAME's
+# job. Derivation and the rejected max-spread assignment:
+# docs/superpowers/specs/2026-09-08-workspace-routed-urls-design.md.
+#
+# Firefox spells it "grey", not "gray" -- the Chromium-compatible spelling.
+WSID_FF_COLOR=(blue yellow red grey purple orange orange yellow grey cyan)
+
+wsid_ff_color() {
+	local i; i="$(wsid_cell "$@")" || return 1
+	printf '%s\n' "${WSID_FF_COLOR[$i]}"
+}
+
+# wsid_session_name <label> -> canonical tmux/Hyprland task-space name.
+# Rules mirror operatord's session_name port EXACTLY. Names must survive tmux's
+# target grammar and format expansion as well as Hyprland's workspace addressing:
+# ASCII controls/whitespace and . : / # -> "-", collapse "--", strip edge "-".
+wsid_session_name() {
+  local s="$1"
+  s="${s//[.:\/#]/-}"
+  s="$(printf '%s' "$s" | LC_ALL=C tr '\001-\040\177' '-')"
+  while [[ "$s" == *--* ]]; do s="${s//--/-}"; done
+  s="${s#-}"; s="${s%-}"
+  printf '%s' "$s"
+}

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for ws-rename (SUPER+ALT+N). Every external is stubbed:
+# the prompt, hyprctl, tmux, tmux-local-clients, the notifier.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_RENAME="${WS_RENAME:-$here/../bin/ws-rename}"
+fails=0
+
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ $actual == "$expected" ]]; then printf 'ok   - %s\n' "$name"; else
+    printf 'FAIL - %s\n' "$name"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$expected" "$actual"
+    fails=$((fails + 1))
+  fi
+}
+
+TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
+mkdir -p "$TMPD/bin"
+
+cat > "$TMPD/bin/hyprctl" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  'activeworkspace -j') cat "$STUB_DIR/active.json" ;;
+  'workspaces -j') cat "$STUB_DIR/workspaces.json" ;;
+  dispatch*) printf '%s\n' "$@" > "$STUB_DIR/dispatch.argv" ;;
+  systeminfo) printf 'configProvider: lua\n' ;;
+  *) exit 64 ;;
+esac
+STUB
+cat > "$TMPD/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+if [[ $1 == has-session ]]; then
+  [[ ${TMUX_COLLISION:-0} == 1 ]]
+  exit
+fi
+printf '%s\n' "$@" > "$STUB_DIR/tmux.argv"
+STUB
+cat > "$TMPD/bin/tmux-local-clients" <<'STUB'
+#!/usr/bin/env bash
+[[ ${RESOLVER_FAIL:-0} == 1 ]] && exit 7
+cat "$STUB_DIR/associations.json"
+STUB
+# The Quickshell dialog path: a live bar answers "ok" and takes over, which a
+# hermetic test must never let happen. Answer as a shell that is down.
+printf '#!/usr/bin/env bash\necho unknown\n' > "$TMPD/bin/omarchy-shell"
+cat > "$TMPD/bin/omarchy-menu-input" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$1" > "$STUB_DIR/prompt.txt"
+[[ -n ${INPUT:-} ]] || exit 1
+printf '%s\n' "$INPUT"
+STUB
+cat > "$TMPD/bin/omarchy-notification-send" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
+STUB
+chmod +x "$TMPD/bin/"*
+export STUB_DIR="$TMPD" PATH="$TMPD/bin:$PATH"
+
+reset_case() {
+  rm -f "$TMPD"/{dispatch,tmux}.argv "$TMPD/notify.log" "$TMPD/prompt.txt"
+  printf '%s\n' '{"id":3,"name":"oracle"}' > "$TMPD/active.json"
+  printf '%s\n' '[{"id":2,"name":"mirepoix"},{"id":3,"name":"oracle"}]' > "$TMPD/workspaces.json"
+  printf '%s\n' '[]' > "$TMPD/associations.json"
+  export RESOLVER_FAIL=0 TMUX_COLLISION=0; unset INPUT
+}
+run_subject() { bash "$WS_RENAME" > "$TMPD/stdout" 2> "$TMPD/stderr"; subject_status=$?; }
+argv() { [[ -f "$TMPD/$1.argv" ]] && cat "$TMPD/$1.argv" || printf 'none'; }
+
+reset_case; run_subject
+assert_eq "cancelled prompt does nothing" "none/none/0" "$(argv dispatch)/$(argv tmux)/$subject_status"
+assert_eq "prompt shows the current name" "Rename workspace (oracle)" "$(< "$TMPD/prompt.txt")"
+
+reset_case; INPUT="oracle"; export INPUT; run_subject
+assert_eq "same name is a no-op" "none/none" "$(argv dispatch)/$(argv tmux)"
+
+reset_case; INPUT="   "; export INPUT; run_subject
+assert_eq "whitespace-only canonical result is refused" "none/none/1" "$(argv dispatch)/$(argv tmux)/$(grep -c 'Rename refused' "$TMPD/notify.log")"
+
+reset_case; INPUT="notes"; export INPUT; run_subject
+assert_eq "no session: renames the workspace directly" $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "notes"})' "$(argv dispatch)"
+assert_eq "no session: tmux untouched" "none" "$(argv tmux)"
+
+reset_case; INPUT="recipe box#draft"; export INPUT; run_subject
+assert_eq "no session: workspace receives canonical name" $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "recipe-box-draft"})' "$(argv dispatch)"
+assert_eq "no session: format syntax never reaches tmux" "none" "$(argv tmux)"
+
+reset_case; INPUT="notes"; export INPUT
+printf '%s\n' '[{"session":"oracle","address":"0x1","pid":1,"workspace":{"id":3,"name":"oracle"},"class":"kitty","focusHistoryID":2},{"session":"other","address":"0x2","pid":2,"workspace":{"id":3,"name":"oracle"},"class":"foot","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq "session on this workspace: renames the most recently focused session" $'rename-session\n-t\n=other:\nnotes' "$(argv tmux)"
+assert_eq "session path leaves hyprctl to the hook" "none" "$(argv dispatch)"
+
+reset_case; INPUT="recipe box#draft"; export INPUT
+printf '%s\n' '[{"session":"oracle","address":"0x1","pid":1,"workspace":{"id":3,"name":"oracle"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq "canonical name: tmux receives the same stored form" $'rename-session\n-t\n=oracle:\nrecipe-box-draft' "$(argv tmux)"
+assert_eq "canonical name: normalization notifies once" "1" "$(grep -c "recipe-box-draft" "$TMPD/notify.log")"
+
+reset_case; INPUT="test"; export INPUT
+printf '%s\n' '{"id":4,"name":"4"}' > "$TMPD/active.json"
+printf '%s\n' '[{"id":2,"name":"mirepoix"},{"id":4,"name":"4"}]' > "$TMPD/workspaces.json"
+printf '%s\n' '[{"session":"test","address":"0x4","pid":4,"workspace":{"id":4,"name":"4"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq "matching session: repairs workspace directly" $'dispatch
+hl.dsp.workspace.rename({workspace = 4, name = "test"})' "$(argv dispatch)"
+assert_eq "matching session: tmux remains untouched" "none" "$(argv tmux)"
+assert_eq "matching session: exits successfully" 0 "$subject_status"
+
+reset_case; INPUT="notes"; export INPUT TMUX_COLLISION=1
+printf '%s\n' '[{"session":"oracle","address":"0x1","pid":1,"workspace":{"id":3,"name":"oracle"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq "existing different tmux session: mutates nothing" "none/none/1" "$(argv dispatch)/$(argv tmux)/$(grep -c 'Rename refused' "$TMPD/notify.log")"
+
+reset_case; INPUT="notes"; export INPUT
+printf '%s\n' '[{"session":"x","address":"0x9","pid":9,"workspace":{"id":5,"name":"5"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq "session on ANOTHER workspace is ignored" $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "notes"})' "$(argv dispatch)"
+
+reset_case; INPUT="notes"; export INPUT RESOLVER_FAIL=1; run_subject
+assert_eq "resolver failure falls back to the workspace path" $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "notes"})' "$(argv dispatch)"
+
+for bad in 7 mirepoix '###'; do
+  reset_case; INPUT="$bad"; export INPUT; run_subject
+  assert_eq "refuses '$bad' and notifies" "none/none/1" "$(argv dispatch)/$(argv tmux)/$(grep -c "Rename refused" "$TMPD/notify.log")"
+done
+
+reset_case; INPUT="special:x"; export INPUT; run_subject
+assert_eq "special namespace input is canonicalized safely" $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "special-x"})' "$(argv dispatch)"
+
+printf '\n%d failures\n' "$fails"; exit $(( fails > 0 ))

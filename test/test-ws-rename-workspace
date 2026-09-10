@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for tmux-to-workspace rename propagation.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_RENAME="${WS_RENAME:-$here/../bin/ws-rename-workspace}"
+fails=0
+
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ $actual == "$expected" ]]; then
+    printf 'ok   - %s\n' "$name"
+  else
+    printf 'FAIL - %s\n' "$name"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$expected" "$actual"
+    fails=$((fails + 1))
+  fi
+}
+
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+mkdir -p "$TMPD/bin" "$TMPD/no-hypr"
+
+cat > "$TMPD/bin/hyprctl" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  'workspaces -j') cat "$STUB_DIR/workspaces.json" ;;
+  dispatch*) printf '%s\n' "$@" > "$STUB_DIR/dispatch.argv" ;;
+  systeminfo) printf 'configProvider: lua\n' ;;
+  *) exit 64 ;;
+esac
+STUB
+
+cat > "$TMPD/bin/tmux-local-clients" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' called >> "$STUB_DIR/resolver.log"
+[[ ${RESOLVER_FAIL:-0} == 1 ]] && exit 7
+cat "$STUB_DIR/associations.json"
+STUB
+
+chmod +x "$TMPD/bin/"*
+ln -s /usr/bin/bash "$TMPD/no-hypr/bash"
+ln -s /usr/bin/jq "$TMPD/no-hypr/jq"
+export STUB_DIR="$TMPD" PATH="$TMPD/bin:$PATH"
+
+reset_case() {
+  rm -f "$TMPD/dispatch.argv" "$TMPD/resolver.log" "$TMPD/stderr"
+  printf '%s\n' '[{"id":2,"name":"old"},{"id":3,"name":"three"},{"id":4,"name":"four"},{"id":5,"name":"five"}]' > "$TMPD/workspaces.json"
+  printf '%s\n' '[]' > "$TMPD/associations.json"
+  RESOLVER_FAIL=0
+  export RESOLVER_FAIL
+}
+
+run_subject() {
+  bash "$WS_RENAME" "$@" > "$TMPD/stdout" 2> "$TMPD/stderr"
+  subject_status=$?
+}
+
+for class in kitty foot com.mitchellh.ghostty; do
+  reset_case
+  printf '[{"session":"notes","address":"0xabc","pid":100,"workspace":{"id":2,"name":"old"},"class":"%s","focusHistoryID":0}]\n' "$class" > "$TMPD/associations.json"
+  run_subject notes
+  assert_eq "$class association renames its workspace" $'dispatch
+hl.dsp.workspace.rename({workspace = 2, name = "notes"})' "$(< "$TMPD/dispatch.argv")"
+done
+
+reset_case
+printf '%s\n' '[{"session":"notes","address":"0x300","pid":103,"workspace":{"id":5,"name":"five"},"class":"ghostty","focusHistoryID":4},{"session":"notes","address":"0x200","pid":102,"workspace":{"id":4,"name":"four"},"class":"foot","focusHistoryID":1},{"session":"notes","address":"0x100","pid":101,"workspace":{"id":3,"name":"three"},"class":"kitty","focusHistoryID":1}]' > "$TMPD/associations.json"
+run_subject notes
+assert_eq 'duplicate local windows choose lowest focus then address' $'dispatch
+hl.dsp.workspace.rename({workspace = 3, name = "notes"})' "$(< "$TMPD/dispatch.argv")"
+
+reset_case
+run_subject notes
+assert_eq 'empty resolution is a successful no-op' 0 "$subject_status"
+assert_eq 'empty resolution does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+RESOLVER_FAIL=1
+export RESOLVER_FAIL
+run_subject notes
+assert_eq 'failed resolution is a successful no-op' 0 "$subject_status"
+assert_eq 'failed resolution does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '{not-json' > "$TMPD/associations.json"
+run_subject notes
+assert_eq 'invalid resolution is a successful no-op' 0 "$subject_status"
+assert_eq 'invalid resolution does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"notes","address":"0xabc","pid":100,"workspace":{"id":2,"name":"notes"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+printf '%s\n' '[{"id":2,"name":"notes"}]' > "$TMPD/workspaces.json"
+run_subject notes --dry-run
+assert_eq 'already-correct name is a no-op' "no-op: workspace 2 is already named 'notes'" "$(< "$TMPD/stdout")"
+assert_eq 'already-correct name does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"notes","address":"0xabc","pid":100,"workspace":{"id":2,"name":"old"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+printf '%s\n' '[{"id":2,"name":"old"},{"id":9,"name":"notes"}]' > "$TMPD/workspaces.json"
+run_subject notes --dry-run
+assert_eq 'duplicate workspace name is refused' "refuse: workspace 9 is already named 'notes'" "$(< "$TMPD/stdout")"
+assert_eq 'duplicate workspace name does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+for name in 42 special:drop; do
+  reset_case
+  run_subject "$name" --dry-run
+  assert_eq "guarded name '$name' does not resolve" no "$([[ -e $TMPD/resolver.log ]] && printf yes || printf no)"
+  assert_eq "guarded name '$name' does not dispatch" no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+done
+
+reset_case
+env PATH="$TMPD/no-hypr" STUB_DIR="$TMPD" \
+  bash "$WS_RENAME" notes > "$TMPD/stdout" 2> "$TMPD/stderr"
+subject_status=$?
+assert_eq 'non-Hyprland host is a successful no-op' 0 "$subject_status"
+assert_eq 'non-Hyprland host does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"new notes","address":"0xabc","pid":100,"workspace":{"id":2,"name":"old"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject 'new notes' --dry-run
+assert_eq 'dry-run names the exact action' "would rename workspace 2 ('old') -> 'new notes'" "$(< "$TMPD/stdout")"
+assert_eq 'dry-run does not dispatch' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"new notes","address":"0xabc","pid":100,"workspace":{"id":2,"name":"old"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject 'new notes'
+assert_eq 'spaces remain one rename argument' $'dispatch
+hl.dsp.workspace.rename({workspace = 2, name = "new notes"})' "$(< "$TMPD/dispatch.argv")"
+
+printf '\n'
+if [[ $fails -eq 0 ]]; then
+  printf 'ALL OK\n'
+else
+  printf '%s FAILURES\n' "$fails"
+  exit 1
+fi

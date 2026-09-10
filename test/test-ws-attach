@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for workspace-driven tmux attachment.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_ATTACH="${WS_ATTACH:-$here/../bin/ws-attach}"
+fails=0
+
+assert_eq() {
+  local name=$1 expected=$2 actual=$3
+  if [[ $actual == "$expected" ]]; then
+    printf 'ok   - %s\n' "$name"
+  else
+    printf 'FAIL - %s\n' "$name"
+    printf '       expected: [%s]\n       actual:   [%s]\n' "$expected" "$actual"
+    fails=$((fails + 1))
+  fi
+}
+
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+mkdir -p "$TMPD/bin"
+
+cat > "$TMPD/bin/hyprctl" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  'activeworkspace -j') cat "$STUB_DIR/activeworkspace.json" ;;
+  dispatch*) printf '%s\n' "$@" > "$STUB_DIR/dispatch.argv" ;;
+  systeminfo) printf 'configProvider: lua\n' ;;
+  *) exit 64 ;;
+esac
+STUB
+
+cat > "$TMPD/bin/tmux-local-clients" <<'STUB'
+#!/usr/bin/env bash
+[[ ${RESOLVER_FAIL:-0} == 1 ]] && exit 7
+cat "$STUB_DIR/associations.json"
+STUB
+
+cat > "$TMPD/bin/xdg-terminal-exec" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$STUB_DIR/launch.argv"
+STUB
+
+cat > "$TMPD/bin/omarchy-menu-input" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$1" > "$STUB_DIR/prompt.txt"
+[[ -n ${INPUT:-} ]] || exit 1
+printf '%s\n' "$INPUT"
+STUB
+cat > "$TMPD/bin/omarchy-notification-send" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
+STUB
+
+chmod +x "$TMPD/bin/"*
+export STUB_DIR="$TMPD" PATH="$TMPD/bin:$PATH"
+
+reset_case() {
+  rm -f "$TMPD/dispatch.argv" "$TMPD/launch.argv" "$TMPD/stderr" "$TMPD/prompt.txt" "$TMPD/notify.log"
+  unset INPUT
+  printf '%s\n' '{"id":2,"name":"mirepoix"}' > "$TMPD/activeworkspace.json"
+  printf '%s\n' '[]' > "$TMPD/associations.json"
+  RESOLVER_FAIL=0
+  export RESOLVER_FAIL
+}
+
+run_subject() {
+  bash "$WS_ATTACH" > "$TMPD/stdout" 2> "$TMPD/stderr"
+  subject_status=$?
+}
+
+expected_launch=$'--\ntmux\nnew-session\n-A\n-s\nmirepoix\n;\nset-option\ndetach-on-destroy\non'
+
+reset_case
+run_subject
+assert_eq 'empty associations launch through XDG' 0 "$subject_status"
+assert_eq 'launch argv preserves tmux command boundaries' "$expected_launch" "$(< "$TMPD/launch.argv")"
+assert_eq 'launch does not dispatch focus' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"mirepoix","address":"0xabc","pid":100,"workspace":{"id":2,"name":"mirepoix"},"class":"kitty","focusHistoryID":3}]' > "$TMPD/associations.json"
+run_subject
+assert_eq 'existing association focuses by address' $'dispatch\nfocuswindow\naddress:0xabc' "$(< "$TMPD/dispatch.argv")"
+assert_eq 'existing association does not launch' no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '[{"session":"mirepoix","address":"0x300","pid":103,"workspace":{"id":5,"name":"other"},"class":"ghostty","focusHistoryID":4},{"session":"mirepoix","address":"0x200","pid":102,"workspace":{"id":4,"name":"other"},"class":"foot","focusHistoryID":1},{"session":"mirepoix","address":"0x100","pid":101,"workspace":{"id":3,"name":"other"},"class":"kitty","focusHistoryID":1}]' > "$TMPD/associations.json"
+run_subject
+assert_eq 'duplicate session chooses lowest focus then address' $'dispatch\nfocuswindow\naddress:0x100' "$(< "$TMPD/dispatch.argv")"
+
+reset_case
+printf '%s\n' '[{"session":"another","address":"0xdef","pid":100,"workspace":{"id":3,"name":"other"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq 'association for another session off the active workspace does not match' "$expected_launch" "$(< "$TMPD/launch.argv")"
+
+reset_case
+printf '%s\n' '{"id":2,"name":"new-notes"}' > "$TMPD/activeworkspace.json"
+printf '%s\n' '[{"session":"older","address":"0x300","pid":102,"workspace":{"id":2,"name":"new-notes"},"class":"ghostty","focusHistoryID":4},{"session":"other","address":"0x200","pid":101,"workspace":{"id":2,"name":"new-notes"},"class":"foot","focusHistoryID":1},{"session":"new notes","address":"0x100","pid":100,"workspace":{"id":2,"name":"new-notes"},"class":"kitty","focusHistoryID":1}]' > "$TMPD/associations.json"
+run_subject
+assert_eq 'renamed session fallback chooses lowest focus then address' $'dispatch\nfocuswindow\naddress:0x100' "$(< "$TMPD/dispatch.argv")"
+assert_eq 'renamed session fallback does not launch' no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+
+reset_case
+RESOLVER_FAIL=1
+export RESOLVER_FAIL
+run_subject
+assert_eq 'resolver failure exits nonzero' 1 "$subject_status"
+assert_eq 'resolver failure launches nothing' no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+assert_eq 'resolver failure focuses nothing' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+reset_case
+printf '%s\n' '{not-json' > "$TMPD/associations.json"
+run_subject
+assert_eq 'malformed successful resolver output exits nonzero' 1 "$subject_status"
+assert_eq 'malformed resolver output launches nothing' no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+assert_eq 'malformed resolver output focuses nothing' no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+
+workspace_cases=(
+  '{"id":4,"name":"wacky sax"}' wacky-sax
+)
+for ((i = 0; i < ${#workspace_cases[@]}; i += 2)); do
+  workspace=${workspace_cases[i]}
+  expected=${workspace_cases[i + 1]}
+  reset_case
+  printf '%s\n' "$workspace" > "$TMPD/activeworkspace.json"
+  run_subject
+  mapfile -t launch_args < "$TMPD/launch.argv"
+  assert_eq "workspace $workspace derives session '$expected'" "$expected" "${launch_args[5]:-}"
+done
+
+reset_case; printf '%s\n' '{"id":6,"name":"..."}' > "$TMPD/activeworkspace.json"; run_subject
+assert_eq 'unusable existing workspace name launches nothing' no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+assert_eq 'unusable existing workspace name notifies once' 1 "$(grep -c 'Name refused' "$TMPD/notify.log")"
+
+# --- name on create: an unnamed workspace with no terminal prompts first ------------
+for ws in '{"id":1,"name":"1"}' '{"id":5,"name":""}'; do
+  reset_case; printf '%s\n' "$ws" > "$TMPD/activeworkspace.json"; run_subject
+  assert_eq "unnamed $ws: cancelled prompt launches nothing" no "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)"
+  assert_eq "unnamed $ws: cancelled prompt renames nothing" no "$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)"
+  assert_eq "unnamed $ws: exits 0 on cancel" 0 "$subject_status"
+done
+
+reset_case; printf '%s\n' '{"id":5,"name":"5"}' > "$TMPD/activeworkspace.json"; INPUT="omni space#draft"; export INPUT; run_subject
+assert_eq 'named on create: workspace receives canonical name' $'dispatch
+hl.dsp.workspace.rename({workspace = 5, name = "omni-space-draft"})' "$(< "$TMPD/dispatch.argv")"
+mapfile -t launch_args < "$TMPD/launch.argv"
+assert_eq 'named on create: session receives identical canonical name' omni-space-draft "${launch_args[5]:-}"
+assert_eq 'named on create: prompt names the workspace id' 'Name this task space (workspace 5)' "$(< "$TMPD/prompt.txt")"
+
+reset_case; printf '%s\n' '{"id":5,"name":"5"}' > "$TMPD/activeworkspace.json"; INPUT=" #.:/ "; export INPUT; run_subject
+assert_eq 'named on create: empty canonical name mutates nothing' "no/no/1" "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)/$([[ -e $TMPD/dispatch.argv ]] && printf yes || printf no)/$(grep -c 'Name refused' "$TMPD/notify.log")"
+
+reset_case; printf '%s\n' '{"id":5,"name":"5"}' > "$TMPD/activeworkspace.json"; INPUT="special:magic"; export INPUT; run_subject
+assert_eq 'named on create: special namespace is canonicalized safely' $'dispatch
+hl.dsp.workspace.rename({workspace = 5, name = "special-magic"})' "$(< "$TMPD/dispatch.argv")"
+mapfile -t launch_args < "$TMPD/launch.argv"
+assert_eq 'named on create: canonical special name reaches tmux' special-magic "${launch_args[5]:-}"
+
+reset_case; printf '%s\n' '{"id":5,"name":"5"}' > "$TMPD/activeworkspace.json"; INPUT="7"; export INPUT; run_subject
+assert_eq 'named on create: bare number refused, nothing launched' "no/1" "$([[ -e $TMPD/launch.argv ]] && printf yes || printf no)/$(grep -c 'Name refused' "$TMPD/notify.log")"
+
+reset_case; printf '%s\n' '{"id":1,"name":"1"}' > "$TMPD/activeworkspace.json"
+printf '%s\n' '[{"session":"omni-space","address":"0xabc","pid":1,"workspace":{"id":1,"name":"1"},"class":"kitty","focusHistoryID":0}]' > "$TMPD/associations.json"
+run_subject
+assert_eq 'unnamed workspace with a terminal already: focuses it, no prompt' $'dispatch\nfocuswindow\naddress:0xabc' "$(< "$TMPD/dispatch.argv")"
+assert_eq 'unnamed workspace with a terminal already: never prompted' no "$([[ -e $TMPD/prompt.txt ]] && printf yes || printf no)"
+
+printf '\n'
+if [[ $fails -eq 0 ]]; then
+  printf 'ALL OK\n'
+else
+  printf '%s FAILURES\n' "$fails"
+  exit 1
+fi

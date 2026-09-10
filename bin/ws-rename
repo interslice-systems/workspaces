@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# ws-rename — rename the active Hyprland workspace, through its tmux session when
+# one is attached here. Bound to SUPER+ALT+N.
+#
+# The tmux session name is the identity (docs/setup.md § Workspace / session
+# identity). Ordinary attached-session renames go through tmux, whose
+# session-renamed hook updates Hyprland; sessionless workspaces rename directly.
+# The narrow equal-name attached-session case repairs Hyprland directly because
+# tmux emits no event for an equal-name rename.
+#
+# Cancel (Esc / empty) is silent. Normalization and refusals notify, never hang
+# the prompt.
+#
+# Two front ends, one decider. With no args, prefer the Quickshell rename
+# dialog (interslice.workspaces plugin: live colorhash pill preview), which calls
+# back as `ws-rename --apply <raw>`; when the shell is down, fall back to the
+# plain omarchy-menu-input prompt. Everything from sanitization on is common.
+set -euo pipefail
+
+notify() { omarchy-notification-send -u low "$@" 2>/dev/null || true; }
+
+# Same lib ws-attach sources (sanitizer + shared name guards). Installed to
+# ~/.local/lib; on a box without it say so instead of dying silently.
+# shellcheck source=/dev/null
+if ! source "$HOME/.local/lib/workspace-identity-lib" 2>/dev/null; then
+	notify "ws-rename" "workspace-identity-lib not found; rename unavailable"
+	exit 0
+fi
+
+aw="$(hyprctl activeworkspace -j)"
+ws_id="$(jq -er '.id | select(type == "number" and floor == .)' <<<"$aw")"
+current="$(jq -r '.name' <<<"$aw")"
+
+if [[ "${1:-}" == "--apply" ]]; then
+	raw="${2:-}"
+else
+	# The shell ipc wrapper answers "ok" when a live bar widget accepted the
+	# open (and "unknown" otherwise); the dialog then re-invokes us with
+	# --apply, so this invocation is done.
+	if out="$(omarchy-shell shell summon interslice.workspaces 2>/dev/null)" \
+		&& [[ "$out" == "ok" ]]; then
+		exit 0
+	fi
+	raw="$(omarchy-menu-input "Rename workspace ($current)" --width 420 || true)"
+fi
+[[ -n "$raw" ]] || exit 0
+name="$(wsid_session_name "$raw")"
+[[ "$name" != "$current" ]] || exit 0
+
+if reason="$(wsid_reject_name "$name" "$ws_id")"; then
+	notify "Rename refused" "$reason"
+	exit 0
+fi
+
+[[ "$name" == "$raw" ]] || notify "Using canonical name" "'$raw' became '$name'"
+
+# Prefer the session path: lowest focusHistoryID local client on this workspace.
+if associations="$(tmux-local-clients 2>/dev/null)" \
+	&& old="$(jq -er --argjson id "$ws_id" '
+	     map(select(.workspace.id == $id))
+	     | if length == 0 then empty else min_by([.focusHistoryID, .address]).session end
+	   ' <<<"$associations")"; then
+	if [[ "$old" == "$name" ]]; then
+		wsid_rename_workspace "$ws_id" "$name"
+		exit 0
+	fi
+	if tmux has-session -t "=$name:" 2>/dev/null; then
+		notify "Rename refused" "tmux session '$name' already exists"
+		exit 0
+	fi
+	exec tmux rename-session -t "=$old:" "$name"
+fi
+
+wsid_rename_workspace "$ws_id" "$name"
