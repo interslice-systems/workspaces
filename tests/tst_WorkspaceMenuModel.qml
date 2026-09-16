@@ -5,6 +5,58 @@ import "../WorkspaceMenuModel.js" as Model
 TestCase {
   name: "WorkspaceMenuModel"
 
+  // Attention marks. These mirror statusbar.conf's @sb_mark chain; there is no shared
+  // source, because tmux resolves its own format, so these cases are half of what holds
+  // the tmux bar and this menu to the same reading.
+  readonly property string glyphBlocked: "\uf256"
+  readonly property string glyphDone: "\uf00c"
+  readonly property string glyphIdle: "\u276f"
+  readonly property string glyphWorking: "\uf252"
+  readonly property string glyphBell: "\uf0f3"
+  readonly property string middot: "\u00b7"
+
+  function test_tmux_window_state_follows_the_bar_priority() {
+    compare(Model.tmuxWindowState("|busy|blocked"), "blocked")
+    compare(Model.tmuxWindowState("|waiting|idle"), "idle")
+    compare(Model.tmuxWindowState("|busy"), "busy")
+    compare(Model.tmuxWindowState("||"), "")
+  }
+
+  function test_tmux_window_state_is_anchored_by_the_leading_pipe() {
+    compare(Model.tmuxWindowState("|xblocked"), "")
+    compare(Model.tmuxWindowState("|blockedish"), "blocked")
+  }
+
+  function test_tmux_mark_splits_done_from_idle_on_the_bell() {
+    compare(Model.tmuxMark("idle", true), glyphDone)
+    compare(Model.tmuxMark("idle", false), glyphIdle)
+  }
+
+  function test_tmux_mark_outranks_the_bell_wherever_claude_has_a_state() {
+    compare(Model.tmuxMark("blocked", true), glyphBlocked)
+    compare(Model.tmuxMark("busy", true), glyphWorking)
+    compare(Model.tmuxMark("waiting", true), glyphWorking)
+    compare(Model.tmuxMark("", true), glyphBell)
+    compare(Model.tmuxMark("", false), "")
+  }
+
+  function test_tmux_window_label_spaces_the_glyph_off_the_name() {
+    compare(Model.tmuxWindowLabel(2, "oracle", "busy", false), "2" + middot + glyphWorking + " oracle")
+    compare(Model.tmuxWindowLabel(2, "oracle", "", false), "2" + middot + "oracle")
+  }
+
+  function test_tmux_window_label_keeps_a_bare_index_bare() {
+    compare(Model.tmuxWindowLabel(2, "", "busy", false), "2" + middot + glyphWorking)
+    compare(Model.tmuxWindowLabel(2, "", "", false), "2")
+  }
+
+  function test_ws_bar_label_exposes_only_the_bell() {
+    compare(Model.wsBarLabel(2, "mirepoix", true), "2" + middot + glyphBell + " mirepoix")
+    compare(Model.wsBarLabel(2, "mirepoix", false), "2" + middot + "mirepoix")
+    compare(Model.wsBarLabel(5, "", true), "5" + middot + glyphBell)
+    compare(Model.wsBarLabel(5, "", false), "5")
+  }
+
   function test_colorhash_matches_bash_nfc_contract() {
     verify(typeof Model.fnv1a32 === "function")
     compare(Model.fnv1a32("caf\u00e9"), 0xa82b5049)

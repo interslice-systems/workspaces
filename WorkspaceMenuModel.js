@@ -9,6 +9,67 @@ var TAB_KEYS = ["active", "displayUrl", "favicon", "index", "tabId", "title", "w
 var NATIVE_KEYS = ["cls", "key", "title"]
 var BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
+// --- attention marks, mirroring the tmux status bar -------------------------------
+// These glyphs and this priority are a deliberate COPY of `@sb_mark`/`@sb_body` in
+// ~/.config/tmux/statusbar.conf, so a window reads identically in the bar and in this
+// menu. If that file's chain changes, change it here too -- there is no shared source,
+// because tmux resolves its own format and Quickshell cannot call into it.
+//
+// The four Claude states come from the pane option @claude_state, written by
+// ~/oracle/scripts/claude-attn from Claude Code's hooks. The seen/unseen split that
+// separates `done` from `idle` is tmux's own window_bell_flag: set in a window you are
+// not on, cleared the moment you visit it.
+var TMUX_GLYPH = {
+  blocked: "\uf256",  // hand      stalled until you answer
+  done: "\uf00c",     // check     finished while you were elsewhere
+  idle: "\u276f",     // chevron   finished, and you have looked
+  working: "\uf252",  // hourglass busy, or waiting on something that is not you
+  bell: "\uf0f3"      // bell      a bell where no Claude is running
+}
+
+// One window's state from `#{P:|#{@claude_state}}` -- every pane's value, concatenated
+// with a leading "|" each. The delimiter is what keeps the match anchored: "|blocked"
+// means some pane's value STARTS with blocked, not merely contains it.
+function tmuxWindowState(panes) {
+  var s = String(panes || "")
+  if (s.indexOf("|blocked") !== -1) return "blocked"
+  if (s.indexOf("|idle") !== -1) return "idle"
+  if (s.indexOf("|waiting") !== -1) return "waiting"
+  if (s.indexOf("|busy") !== -1) return "busy"
+  return ""
+}
+
+function tmuxMark(state, bell) {
+  switch (String(state || "")) {
+    case "blocked": return TMUX_GLYPH.blocked
+    case "idle": return bell ? TMUX_GLYPH.done : TMUX_GLYPH.idle
+    case "waiting":
+    case "busy": return TMUX_GLYPH.working
+  }
+  return bell ? TMUX_GLYPH.bell : ""
+}
+
+// The shared body shape: `2\u00b7<glyph> name`, or `2\u00b7<glyph>` unnamed, or a bare
+// `2`. The middot is carried by the NAME, and kept without one only when there is a
+// glyph to hang on it -- so a list of bare indices stays a list of bare indices. The
+// space appears only when there is a glyph, so an unmarked entry stays flush.
+function markedLabel(id, name, mark) {
+  var nm = String(name || "")
+  if (nm) return String(id) + "\u00b7" + (mark ? mark + " " : "") + nm
+  return String(id) + (mark ? "\u00b7" + mark : "")
+}
+
+function tmuxWindowLabel(idx, name, state, bell) {
+  return markedLabel(idx, name, tmuxMark(state, bell))
+}
+
+// The bar pill deliberately exposes ONLY the bell, not the Claude states: a workspace
+// aggregates every window inside it, so ten Claudes would report ten statuses into one
+// slot. The pill answers "something in here rang"; the menu answers "what, exactly".
+function wsBarLabel(id, name, urgent) {
+  return markedLabel(id, name, urgent ? TMUX_GLYPH.bell : "")
+}
+
 // Frozen colorhash contract: FNV1a32(UTF8(NFC(name))).
 function fnv1a32(value) {
   var bytes = unescape(encodeURIComponent(String(value).normalize("NFC")))

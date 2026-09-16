@@ -130,10 +130,13 @@ BarWidget {
     var n = String(w.name || "")
     return (n === "" || n === String(w.id)) ? "" : n
   }
+  // THE PILL EXPOSES ONLY THE BELL, deliberately -- not the Claude states the menu
+  // shows. A workspace aggregates every window inside it, so ten Claudes would report
+  // ten statuses into one slot. The pill answers "something in here rang"; the menu
+  // answers "what, exactly". Placement matches the tmux bar as of 2026-09-16: after the
+  // middot, one space before the name.
   function wsLabel(w, urgent) {
-    var nm = root.wsName(w)
-    var mark = urgent ? root.bellGlyph : ""
-    return String(w.id) + mark + (nm ? "·" + nm : "")
+    return WorkspaceMenuModel.wsBarLabel(w.id, root.wsName(w), urgent)
   }
   function wsKey(w) { var nm = root.wsName(w); return nm ? nm : String(w.id) }
 
@@ -157,9 +160,14 @@ BarWidget {
   function openTerminal() { if (root.bar) root.bar.run("xdg-terminal-exec") }
 
   // --- hover card: tmux snapshot, fetched one-shot on hover-open ------------
-  // tmuxWindows: session name -> [{session, idx, name, bell, star}]. star is
-  // @sb_mark's derivation (statusbar.conf): a U+2733-prefixed pane_title
-  // anywhere in the window means a Claude awaits input; bell beats star.
+  // tmuxWindows: session name -> [{session, idx, name, bell, state}]. state is the
+  // pane option @claude_state (blocked/idle/waiting/busy), reduced across the window's
+  // panes by WorkspaceMenuModel.tmuxWindowState with the bar's own priority.
+  //
+  // This replaced a U+2733-prefixed pane_title scrape on 2026-09-16. That rule had been
+  // DEAD since Claude Code 2.1.267: a GrowthBook flag forces a static U+2733 into the
+  // title whenever $TMUX is set, so every Claude window matched, always. The state now
+  // comes from Claude Code's hooks via ~/oracle/scripts/claude-attn.
   // tmuxAddrs: Hyprland window address -> session, from tmux-local-clients --
   // the addresses the hover card must NOT list as bare windows.
   property var tmuxWindows: ({})
@@ -171,7 +179,7 @@ BarWidget {
   Process {
     id: tmuxWinProc
     command: ["tmux", "list-windows", "-a", "-F",
-      "#{session_name}\u001f#{window_index}\u001f#{window_name}\u001f#{window_bell_flag}\u001f#{P:|#{pane_title}}"]
+      "#{session_name}\u001f#{window_index}\u001f#{window_name}\u001f#{window_bell_flag}\u001f#{P:|#{@claude_state}}"]
     stdout: StdioCollector {
       onStreamFinished: {
         var map = {}
@@ -182,7 +190,7 @@ BarWidget {
           if (p.length < 5) continue
           var w = { session: p[0], idx: parseInt(p[1], 10), name: p[2],
                     bell: p[3] === "1",
-                    star: p.slice(4).join("\u001f").indexOf("|✳") !== -1 }
+                    state: WorkspaceMenuModel.tmuxWindowState(p.slice(4).join("\u001f")) }
           if (!map[w.session]) map[w.session] = []
           map[w.session].push(w)
         }
@@ -423,7 +431,7 @@ BarWidget {
   }
 
   // Keep the snapshot honest WHILE the menu is showing: a bell that rings with
-  // it open re-fetches the tmux half, so window_bell_flag/✳ marks appear live
+  // it open re-fetches the tmux half, so window_bell_flag/@claude_state marks appear live
   // instead of on the next open. Gated on the menu -- closed, zero listeners
   // doing work. Both event spellings, same as operatord (foot rings bell>>,
   // kitty urgent>>).

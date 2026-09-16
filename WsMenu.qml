@@ -25,7 +25,7 @@ import "WorkspaceMenuModel.js" as WorkspaceMenuModel
 // every row is disabled so a second action cannot replace its native target.
 //
 // Data contract is unchanged from the tree card: Hyprland toplevels live from
-// the workspace's in-memory model; the tmux half (window list, ✳/bell marks,
+// the workspace's in-memory model; the tmux half (window list, @claude_state/bell marks,
 // client addresses) is the owner's one-shot snapshot, fetched on open and
 // re-fetched on bell/urgent raw events while open. Marks are glyphs, colour
 // is identity: tmux rows hash the WINDOW NAME (cells[fnv1a32(name) % n],
@@ -198,9 +198,10 @@ PopupCard {
             anchors.leftMargin: Style.space(8)
             width: parent.width - Style.space(16)
             text: rowRect.isTmux
-              ? rowRect.modelData.win.idx
-                + (rowRect.modelData.win.bell ? card.ws.bellGlyph : (rowRect.modelData.win.star ? "✳" : ""))
-                + (rowRect.modelData.win.name ? "·" + rowRect.modelData.win.name : "")
+              ? WorkspaceMenuModel.tmuxWindowLabel(rowRect.modelData.win.idx,
+                                                   rowRect.modelData.win.name,
+                                                   rowRect.modelData.win.state,
+                                                   rowRect.modelData.win.bell)
               : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")
                 + rowRect.modelData.cls
                 + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")

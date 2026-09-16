@@ -95,7 +95,7 @@ assert_count "tabs argv token is declared exactly once" 1 \
 assert_regex_count "workspace has exactly six semantic command sinks" 6 \
   '(^|[^[:alnum:]_])(command[[:space:]]*:|[[:alnum:]_]+[[:space:]]*\.[[:space:]]*command[[:space:]]*=)' "$workspaces"
 assert_multiline "tmux window command is pinned to its Process" \
-  $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{P:|#{pane_title}}"]' "$workspaces"
+  $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{P:|#{@claude_state}}"]' "$workspaces"
 assert_multiline "tmux client command is pinned to its Process" \
   $'  Process {\n    id: tmuxClientsProc\n    command: [Quickshell.env("HOME") + "/.local/bin/tmux-local-clients"]' "$workspaces"
 assert_multiline "snapshot command is pinned to its Process" \
@@ -270,7 +270,7 @@ assert_count "bare label, tab title, and tab URL each elide" \
 assert_count "every browser-derived text path is forced plain" \
   3 'textFormat: Text.PlainText' "$menu"
 assert_multiline "bare native label is forced plain before elision" \
-  $'            text: rowRect.isTmux\n              ? rowRect.modelData.win.idx\n                + (rowRect.modelData.win.bell ? card.ws.bellGlyph : (rowRect.modelData.win.star ? "✳" : ""))\n                + (rowRect.modelData.win.name ? "·" + rowRect.modelData.win.name : "")\n              : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                + rowRect.modelData.cls\n                + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")\n            textFormat: Text.PlainText\n            color:' "$menu"
+  $'            text: rowRect.isTmux\n              ? WorkspaceMenuModel.tmuxWindowLabel(rowRect.modelData.win.idx,\n                                                   rowRect.modelData.win.name,\n                                                   rowRect.modelData.win.state,\n                                                   rowRect.modelData.win.bell)\n              : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                + rowRect.modelData.cls\n                + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")\n            textFormat: Text.PlainText\n            color:' "$menu"
 assert_multiline "Firefox title is forced plain and remains first" \
   $'            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              font.family: Style.font.family\n              font.pixelSize: Style.font.body\n              font.bold: rowRect.isActiveFirefox\n              elide: Text.ElideRight\n              wrapMode: Text.NoWrap\n              renderType: Text.NativeRendering\n            }\n\n            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText' "$menu"
 assert_multiline "Firefox display URL is forced plain before elision" \
@@ -317,6 +317,68 @@ else
   fail "packaged Firefox fallback mode is 0644"
   printf '       expected mode: 644\n'
   printf '       actual mode: %s\n' "$firefox_icon_mode"
+fi
+
+# --- attention marks ---------------------------------------------------------------
+# These are a deliberate copy of statusbar.conf's @sb_mark chain, so a window reads the
+# same in the tmux bar and in this menu. There is no shared source (tmux resolves its own
+# format), so the structural assertions below are the only thing holding the two together.
+assert_contains "menu reads @claude_state, not the dead pane_title star" \
+  '#{P:|#{@claude_state}}' "$workspaces"
+assert_not_contains "the U+2733 pane_title scrape is gone" \
+  '#{P:|#{pane_title}}' "$workspaces"
+assert_contains "window rows go through the shared label" \
+  'WorkspaceMenuModel.tmuxWindowLabel(' "$menu"
+assert_contains "the bar pill goes through the shared label" \
+  'WorkspaceMenuModel.wsBarLabel(' "$workspaces"
+
+# The pure functions actually execute here, rather than only being grepped for. The JS
+# is a .pragma library, which node cannot parse, so the directive is stripped first.
+model="$plugin_dir/WorkspaceMenuModel.js"
+if command -v node >/dev/null 2>&1; then
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  sed 's/^\.pragma library$//' "$model" > "$tmpdir/model.mjs"
+  cat >> "$tmpdir/model.mjs" <<'MJS'
+export { tmuxWindowState, tmuxMark, tmuxWindowLabel, wsBarLabel }
+MJS
+  cat > "$tmpdir/check.mjs" <<'MJS'
+import { tmuxWindowState, tmuxMark, tmuxWindowLabel, wsBarLabel } from "./model.mjs"
+const H = "", D = "", I = "❯", W = "", B = "", M = "·"
+const cases = [
+  ["blocked beats every other pane state", tmuxWindowState("|busy|blocked"), "blocked"],
+  ["idle beats waiting", tmuxWindowState("|waiting|idle"), "idle"],
+  ["no Claude pane yields no state", tmuxWindowState("||"), ""],
+  ["the leading pipe anchors the match", tmuxWindowState("|xblocked"), ""],
+  ["blocked outranks a bell", tmuxMark("blocked", true), H],
+  ["idle unseen is done", tmuxMark("idle", true), D],
+  ["idle seen is the chevron", tmuxMark("idle", false), I],
+  ["waiting and busy are both working", tmuxMark("waiting", false) + tmuxMark("busy", false), W + W],
+  ["working outranks a bell", tmuxMark("busy", true), W],
+  ["a bell shows only with no Claude state", tmuxMark("", true), B],
+  ["no state and no bell is no mark", tmuxMark("", false), ""],
+  ["a marked name gets one space", tmuxWindowLabel(2, "oracle", "busy", false), "2" + M + W + " oracle"],
+  ["an unmarked name stays flush", tmuxWindowLabel(2, "oracle", "", false), "2" + M + "oracle"],
+  ["an unnamed window keeps the middot for a mark", tmuxWindowLabel(2, "", "busy", false), "2" + M + W],
+  ["an unnamed unmarked window is a bare index", tmuxWindowLabel(2, "", "", false), "2"],
+  ["the pill exposes the bell only", wsBarLabel(2, "mirepoix", true), "2" + M + B + " mirepoix"],
+  ["a quiet pill is flush", wsBarLabel(2, "mirepoix", false), "2" + M + "mirepoix"],
+  ["an unnamed urgent pill keeps the middot", wsBarLabel(5, "", true), "5" + M + B],
+]
+let bad = 0
+for (const [name, got, want] of cases) {
+  if (got === want) { console.log("ok   - " + name); continue }
+  console.log("FAIL - " + name)
+  console.log("       got  " + JSON.stringify(got))
+  console.log("       want " + JSON.stringify(want))
+  bad++
+}
+process.exit(bad ? 1 : 0)
+MJS
+  if node "$tmpdir/check.mjs"; then :; else fails=$((fails + 1)); fi
+  rm -rf "$tmpdir"; trap - EXIT
+else
+  printf 'skip - attention-mark behaviour (node not installed)\n'
 fi
 
 if (( fails > 0 )); then
