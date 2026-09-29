@@ -440,7 +440,8 @@ PopupCard {
             width: visible ? implicitWidth : 0
             visible: rowRect.isGone || rowRect.isAgentGone
             Repeater {
-              model: rowRect.isGone ? ["restore", "dismiss"] : (rowRect.isAgentGone ? ["restore"] : [])
+              model: rowRect.isGone ? (card.targetGhost ? ["dismiss"] : ["restore", "dismiss"])
+                : (rowRect.isAgentGone ? ["restore"] : [])
               Item {
                 id: btn
                 required property string modelData

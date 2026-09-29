@@ -408,6 +408,9 @@ assert_not_contains "ghost list is not a per-write binding" 'readonly property v
 
 assert_contains "rows report their natural width so the card can size to content" 'implicitWidth: rowRect.naturalWidth' "$menu"
 
+assert_contains "rows under a ghost workspace offer only dismiss (Restore workspace is the way back)" \
+  'model: rowRect.isGone ? (card.targetGhost ? ["dismiss"] : ["restore", "dismiss"])' "$menu"
+
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"
   exit 1
