@@ -1,11 +1,14 @@
 """ws-blackbox: record tmux windows and their Claude sessions; restore what disappeared."""
 import argparse
+import os
+import shlex
 import sys
 import time
 
 from . import ledger as ledger_mod
 from . import observe, paths, state
 from .procs import ProcTable
+from .tmuxctl import Forbidden, TmuxError
 
 
 def _not_yet(args):
@@ -195,3 +198,65 @@ def cmd_what(args):
 
 HANDLERS["status"] = cmd_status
 HANDLERS["what"] = cmd_what
+
+
+def notify(summary, body):
+    if os.environ.get("WS_BLACKBOX_NO_NOTIFY"):
+        return
+    try:
+        observe.run(["notify-send", "-a", "ws-blackbox", summary, body])
+    except observe.SourceError:
+        pass
+
+
+def cmd_dismiss(args):
+    d = state.ensure_state_dir()
+    with state.locked(d):
+        led, problem = state.load_ledger(d, int(time.time()), repair=False)
+        if problem:
+            print("ledger unreadable", file=sys.stderr)
+            return 1
+        if args.workspace:
+            rows, error = observe.observe_now()
+            if error:
+                print("tmux query failed", file=sys.stderr)
+                return 1
+            live = ledger_mod.live_keys(observe.boot8(paths.boot_id_file()), rows)
+            n = ledger_mod.dismiss_workspace(led, args.workspace, live)
+        elif args.key:
+            n = 1 if led["windows"].pop(args.key, None) is not None else 0
+        else:
+            print("dismiss needs a key or --workspace", file=sys.stderr)
+            return 2
+        state.atomic_write_json(d / state.LEDGER, led)
+    print(f"dismissed {n}")
+    return 0
+
+
+def cmd_restore(args):
+    from . import restore, typed
+    try:
+        if args.workspace:
+            notes, log = restore.restore_workspace(args.workspace, args.dry_run)
+        elif args.pane:
+            notes, log = restore.restore_pane(args.pane[0], args.pane[1], args.dry_run)
+        elif args.key:
+            notes, log = restore.restore_window(args.key, args.dry_run)
+        else:
+            print("restore needs a key, --pane or --workspace", file=sys.stderr)
+            return 2
+    except (typed.Refused, TmuxError, Forbidden, state.LockTimeout) as why:
+        notify("Restore refused", str(why))
+        print(f"refused: {why}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        for argv in log:
+            print(shlex.join(argv))
+    for note in notes:
+        notify("Restore", note)
+        print(note)
+    return 0
+
+
+HANDLERS["dismiss"] = cmd_dismiss
+HANDLERS["restore"] = cmd_restore
