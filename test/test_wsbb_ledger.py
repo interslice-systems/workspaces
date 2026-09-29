@@ -106,6 +106,28 @@ class LiveAndDismissTest(unittest.TestCase):
         self.assertNotIn("s", led["workspaces"])
 
 
+class CarryOverTest(unittest.TestCase):
+    def test_restored_window_inherits_its_claude_under_the_new_key(self):
+        led = empty()
+        claude = {"session_id": UUID_A, "name": "n", "status": "idle", "pid": 11}
+        L.upsert(led, obs(window(claude=claude)), 100)
+        old = L.window_key("b00b1e55", 7, 70, "@1")
+        led["windows"][old]["panes"][0]["children"] = [{"comm": "ruby", "cmd": "ruby bin/dev"}]
+        new = L.carry_over(led, old, "b00b1e55", 8, 80, "@5", ["%9"], 200)
+        self.assertEqual(new, "b00b1e55:8:80:@5")
+        self.assertNotIn(old, led["windows"])                      # one atomic hand-over
+        e = led["windows"][new]
+        self.assertEqual((e["window_id"], e["server"], e["first_seen"]),
+                         ("@5", {"boot_id": "b00b1e55", "pid": 8, "start": 80}, 200))
+        pane = e["panes"][0]
+        self.assertEqual(pane["pane_id"], "%9")
+        self.assertEqual(pane["claude"]["session_id"], UUID_A)
+        self.assertEqual(pane["children"], [])                     # those processes are not running
+        # the next tick sees the new window at a bare shell: the Claude record survives it
+        L.upsert(led, obs(dict(window(wid="@5", pane="%9"), server_pid=8, server_start=80)), 260)
+        self.assertEqual(led["windows"][new]["panes"][0]["claude"]["session_id"], UUID_A)
+
+
 class TickTest(unittest.TestCase):
     def test_tick_with_no_server_writes_full_heartbeat_and_no_windows(self):
         with tempfile.TemporaryDirectory() as tmp:

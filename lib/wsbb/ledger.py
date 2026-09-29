@@ -100,3 +100,17 @@ def forget_agent(ledger, key, pane_id):
             pane["claude"] = None
             return True
     return False
+
+
+def carry_over(ledger, old_key, boot8, server_pid, server_start, window_id, pane_ids, now):
+    """A rebuilt window takes over its old entry under its new key, Claude records included,
+    so it keeps offering to resume each Claude until one is actually running there again.
+    Old key out, new key in, in one write: no moment where the window is in neither."""
+    new = copy.deepcopy(ledger["windows"].pop(old_key))
+    new.update(window_id=window_id, first_seen=now, last_seen=now, restored_to=None,
+               server={"boot_id": boot8, "pid": server_pid, "start": server_start})
+    new["panes"] = [dict(p, pane_id=pid, pid=None, children=[])      # those processes are gone
+                    for p, pid in zip(new["panes"], pane_ids)]
+    key = window_key(boot8, server_pid, server_start, window_id)
+    ledger["windows"][key] = new
+    return key

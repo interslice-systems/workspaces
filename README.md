@@ -82,10 +82,21 @@ machine's mimeapps says so.
 ## ws-blackbox (optional): remember what disappeared
 
 `bin/ws-blackbox` records every tmux window, its panes, and the Claude Code session in each
-pane once a minute (a systemd user timer; nothing stays resident). When a window or a whole
-workspace disappears -- closed, crashed, OOM-killed, rebooted -- the bar keeps it: a greyed
-`gone` row in the workspace menu, or an outlined pill for a vanished workspace. ↺ rebuilds it
-and **types** `claude --resume <id>` at the prompt without pressing Enter; ✕ forgets it.
+pane once a minute (a systemd user timer; nothing stays resident). What disappears stays in
+the bar, with ↺ to bring it back and ✕ to forget it:
+
+| What disappeared | Shown as | ↺ |
+|---|---|---|
+| a Claude exited, its window is still open | caption `claude <name> · exited` | types its resume line at that pane's prompt |
+| a tmux window (closed, crashed, killed) | dimmed row at its old index | rebuilds it: index, name, splits, layout, each pane's directory, and a resume line wherever a Claude was |
+| a whole workspace (server died, OOM, reboot) | outlined pill | opens a terminal on a free workspace, restarts the session under its name, rebuilds each window |
+
+↺ **types** `cd <dir> && claude --resume <id>` without pressing Enter: Enter resumes, Ctrl+U
+declines. It always takes you to the pane, and pressing it again never types a second copy.
+A rebuilt window keeps its Claude record, so it goes on offering the resume until a Claude is
+actually running there. Running processes other than Claude -- dev servers, editors, ssh --
+are listed in the row's caption as a reminder, never replayed; scrollback and shell state are
+lost with the server.
 
 ```sh
 ln -sfn "$R"/bin/ws-blackbox ~/.local/bin/
@@ -97,7 +108,7 @@ ws-blackbox what     # what is gone, why (journald), and the resume lines
 
 State lives in `~/.local/state/ws-blackbox/` (0700). It stores window names, working
 directories, Claude session ids and short command names -- never full command lines. Nothing
-is pruned automatically: an entry leaves only when you dismiss or restore it. Without the
+is pruned automatically: an entry leaves only when you dismiss it or it is restored. Without the
 timer installed the widget looks exactly as it did.
 
 Workspace restore asks Hyprland to launch the terminal, so the terminal (and any tmux server

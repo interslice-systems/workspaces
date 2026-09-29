@@ -82,7 +82,8 @@ def create_window(tmux, entry):
     return out[0], [out[1]]
 
 
-def finish_window(tmux, entry, window_id, pane_ids):
+def build_panes(tmux, entry, window_id, pane_ids):
+    """Splits, layout and name: the quick part of a rebuild, done while the ledger is locked."""
     for n, pane in enumerate(entry["panes"][1:], start=1):
         out = tmux("split-window", "-d", "-t", window_id, "-c", pane["cwd"], "-P", "-F", "#{pane_id}",
                    mutate=True).strip()
@@ -94,6 +95,10 @@ def finish_window(tmux, entry, window_id, pane_ids):
             pass
     if not entry.get("automatic_rename"):
         tmux("rename-window", "-t", window_id, "--", entry["name"], mutate=True)
+
+
+def type_lines(tmux, entry, pane_ids):
+    """The slow part (each pane's shell must come up first), done after the lock is released."""
     notes = []
     for (line, note), pane_id in zip(lines_for(entry), pane_ids):
         if note:
@@ -101,6 +106,14 @@ def finish_window(tmux, entry, window_id, pane_ids):
         elif line and not type_line(tmux, pane_id, line):
             notes.append(f"{entry['name']}: pane not ready; type it yourself: {line}")
     return notes
+
+
+def hand_over(d, tmux, key, boot, window_id, pane_ids):
+    """Move the ledger entry to the rebuilt window's key (caller holds the lock)."""
+    led = _load_for_restore(d)
+    pid, start = current_server(tmux)
+    L.carry_over(led, key, boot, pid, start, window_id, pane_ids, int(time.time()))
+    state.atomic_write_json(d / state.LEDGER, led)
 
 
 def _load_for_restore(d):
@@ -129,17 +142,11 @@ def restore_window(key, dry_run=False):
         if key in L.live_keys(boot, rows):
             raise typed.Refused("window is still open")
         window_id, pane_ids = create_window(tmux, entry)
+        build_panes(tmux, entry, window_id, pane_ids)
         if not dry_run:
-            pid, start = current_server(tmux)
-            entry["restored_to"] = L.window_key(boot, pid, start, window_id)
-            state.atomic_write_json(d / state.LEDGER, led)
-    notes = finish_window(tmux, entry, window_id, pane_ids)
+            hand_over(d, tmux, key, boot, window_id, pane_ids)
+    notes = type_lines(tmux, entry, pane_ids)
     activate(tmux, window_id)
-    if not dry_run:
-        with state.locked(d):
-            led = _load_for_restore(d)
-            led["windows"].pop(key, None)
-            state.atomic_write_json(d / state.LEDGER, led)
     return notes, tmux.log
 
 
@@ -302,17 +309,12 @@ def restore_workspace(name, dry_run=False):
     taken = {int(x) for x in tmux("list-windows", "-t", "=" + name, "-F", "#{window_index}").split()}
     if int(index) != first["index"] and first["index"] not in taken:
         tmux("move-window", "-s", window_id, "-t", f"={name}:{first['index']}", mutate=True)
+    pane_ids = [pane_id]
     with state.locked(d):
-        led = _load_for_restore(d)
-        pid, start = current_server(tmux)
-        if ghosts[0] in led["windows"]:
-            led["windows"][ghosts[0]]["restored_to"] = L.window_key(boot, pid, start, window_id)
-            state.atomic_write_json(d / state.LEDGER, led)
-    notes += finish_window(tmux, first, window_id, [pane_id])
-    with state.locked(d):
-        led = _load_for_restore(d)
-        led["windows"].pop(ghosts[0], None)
-        state.atomic_write_json(d / state.LEDGER, led)
+        build_panes(tmux, first, window_id, pane_ids)
+        if ghosts[0] in _load_for_restore(d)["windows"]:
+            hand_over(d, tmux, ghosts[0], boot, window_id, pane_ids)
+    notes += type_lines(tmux, first, pane_ids)
     for key in ghosts[1:]:
         try:
             more, _ = restore_window(key)

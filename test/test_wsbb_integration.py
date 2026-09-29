@@ -105,6 +105,13 @@ class RestoreIntegrationTest(unittest.TestCase):
         self.assertEqual(self.tmux("display-message", "-p", "-t", f"={SESSION}:5",
                                    "#{pane_current_command}").strip(), "bash")     # typed, NOT run
         self.assertNotIn(key, self.ledger()["windows"])
+        # the rebuilt window inherits the Claude record, and keeps it through a tick at a bare
+        # shell: until Enter is pressed the row still offers to resume it
+        for _ in range(2):
+            carried = [e for e in self.ledger()["windows"].values() if e["name"] == "agent"]
+            self.assertEqual(len(carried), 1)
+            self.assertEqual(carried[0]["panes"][0]["claude"]["session_id"], UUID)
+            self.assertEqual(self.bb("tick").returncode, 0)
 
         again = self.bb("restore", key)                                         # double click
         self.assertEqual(again.returncode, 1)
@@ -268,6 +275,43 @@ class RestoreIntegrationTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("5:agent", self.tmux("list-windows", "-t", f"={SESSION}", "-F", "#{window_index}:#{window_name}"))
         self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-t", f"={SESSION}:5")))
+
+    def fake_desktop(self):
+        """hyprctl, the terminal and the identity lib, faked: dispatch runs `_spawn`, and the
+        'terminal' starts the session detached on the same private socket."""
+        b = self.base / "bin"
+        (b / "hyprctl").write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  workspaces) echo '[]' ;;\n"
+            "  dispatch) id=$(printf '%s' \"$2\" | sed -n 's/.*_spawn \\([0-9a-f]*\\).*/\\1/p')\n"
+            "            \"$WS_BLACKBOX_SELF\" _spawn \"$id\" >/dev/null 2>&1 &\n"
+            "            echo ok ;;\n"
+            "esac\n")
+        (b / "xdg-terminal-exec").write_text('#!/bin/sh\nshift 3\nexec tmux new-session -d "$@"\n')
+        for f in ("hyprctl", "xdg-terminal-exec"):
+            (b / f).chmod(0o755)
+        lib = self.base / "identity-lib.sh"
+        lib.write_text("wsid_reject_name() { return 1; }\nwsid_rename_workspace() { :; }\n")
+        self.env.update(WS_BLACKBOX_SELF=str(BIN), WS_BLACKBOX_IDENTITY_LIB=str(lib))
+
+    def test_workspace_restore_rebuilds_the_session_and_keeps_its_claude(self):
+        self.fake_desktop()
+        kid = self.start_agent_window()
+        self.tmux("kill-window", "-t", f"={SESSION}:0")                  # the agent is the only window
+        self.assertEqual(self.bb("tick").returncode, 0)
+        os.kill(kid, 15)
+        subprocess.run(["tmux", "kill-server"], env=self.env, capture_output=True)   # private socket
+        res = self.bb("restore", "--workspace", SESSION)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("5:agent", self.tmux("list-windows", "-t", f"={SESSION}", "-F", "#{window_index}:#{window_name}"))
+        self.assertTrue(self.wait(lambda: f"claude --resume {UUID}" in
+                                  self.tmux("capture-pane", "-p", "-J", "-t", f"={SESSION}:5")))
+        for _ in range(2):                                               # survives a tick at the shell
+            carried = [e for e in self.ledger()["windows"].values() if e["name"] == "agent"]
+            self.assertEqual(len(carried), 1)
+            self.assertEqual(carried[0]["panes"][0]["claude"]["session_id"], UUID)
+            self.assertEqual(self.bb("tick").returncode, 0)
 
     def test_no_server_tick_freezes_ledger(self):
         self.start_agent_window()
