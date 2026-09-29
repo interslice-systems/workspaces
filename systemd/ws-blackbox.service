@@ -1,0 +1,9 @@
+[Unit]
+Description=ws-blackbox tick
+OnFailure=ws-blackbox-alert.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ws-blackbox tick
+TimeoutStartSec=20s
+LogLevelMax=notice

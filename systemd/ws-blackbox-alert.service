@@ -1,0 +1,6 @@
+[Unit]
+Description=Tell the desktop that ws-blackbox stopped recording
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -a ws-blackbox -u critical "ws-blackbox stopped" "Recording is off. Run: ws-blackbox status"

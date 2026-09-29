@@ -1,0 +1,10 @@
+[Unit]
+Description=Record tmux windows and their Claude sessions every minute (ws-blackbox)
+
+[Timer]
+OnActiveSec=0
+OnUnitActiveSec=1min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
