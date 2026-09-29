@@ -135,7 +135,7 @@ class RestoreIntegrationTest(unittest.TestCase):
                                                     "#{pane_current_command}").strip() == "bash"))
         res = self.bb("restore", "--pane", key, pane)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(self.wait(lambda: f"claude --resume {UUID}" in self.tmux("capture-pane", "-p", "-t", pane)))
+        self.assertTrue(self.wait(lambda: f"claude --resume {UUID}" in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
 
     def test_double_click_on_agent_gone_types_once(self):
         kid = self.start_agent_window()
@@ -147,10 +147,52 @@ class RestoreIntegrationTest(unittest.TestCase):
                                                     "#{pane_current_command}").strip() == "bash"))
         self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
         second = self.bb("restore", "--pane", key, pane)
-        self.assertEqual(second.returncode, 1)
-        self.assertIn("just", second.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)   # nothing to refuse: it's done
         time.sleep(0.3)
-        self.assertEqual(self.tmux("capture-pane", "-p", "-t", pane).count("claude --resume"), 1)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-J", "-t", pane).count("claude --resume"), 1)
+
+    def exited_agent_pane(self):
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        pane = self.ledger()["windows"][key]["panes"][0]["pane_id"]
+        os.kill(kid, 15)
+        self.assertTrue(self.wait(lambda: self.tmux("display-message", "-p", "-t", pane,
+                                                    "#{pane_current_command}").strip() == "bash"))
+        return key, pane
+
+    def test_restore_again_later_finds_the_line_already_typed(self):
+        key, pane = self.exited_agent_pane()
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
+        (self.base / "state/recent.json").unlink()              # past the double-click guard
+        self.tmux("select-window", "-t", f"={SESSION}:0")
+        again = self.bb("restore", "--pane", key, pane)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        time.sleep(0.3)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-J", "-t", pane).count("claude --resume"), 1)
+        self.assertEqual(self.active_window(), "5")             # still brought to it
+
+    def test_an_old_resume_line_in_the_scrollback_does_not_count(self):
+        key, pane = self.exited_agent_pane()
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
+        self.tmux("send-keys", "-t", pane, "Enter")             # ran it; the fake claude exits at once
+        time.sleep(0.5)
+        self.assertEqual(self.tmux("display-message", "-p", "-t", pane, "#{pane_current_command}").strip(), "bash")
+        (self.base / "state/recent.json").unlink()
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertTrue(self.wait(lambda: self.tmux("capture-pane", "-p", "-J", "-t", pane).count("claude --resume") == 2))
+
+    def test_restore_types_again_once_the_line_was_cleared(self):
+        key, pane = self.exited_agent_pane()
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
+        self.tmux("send-keys", "-t", pane, "C-e", "C-u")        # the person declined with Ctrl+U
+        self.assertTrue(self.wait(lambda: "claude --resume" not in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
+        (self.base / "state/recent.json").unlink()
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-J", "-t", pane)))
 
     def active_window(self):
         rows = self.tmux("list-windows", "-t", f"={SESSION}", "-F", "#{window_active} #{window_index}").split("\n")
@@ -197,8 +239,10 @@ class RestoreIntegrationTest(unittest.TestCase):
         self.bb("tick")
         key = self.agent_key()
         pane = self.ledger()["windows"][key]["panes"][0]["pane_id"]
+        self.assertNotEqual(self.active_window(), "5")
         res = self.bb("restore", "--pane", key, pane)                   # claude still running
         self.assertEqual(res.returncode, 1)
+        self.assertEqual(self.active_window(), "5")                     # refused, but brought there
 
     def test_dismiss_workspace_keeps_live_windows(self):
         kid = self.start_agent_window()

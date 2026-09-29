@@ -10,6 +10,7 @@ from . import observe, paths, state, typed
 from .tmuxctl import Tmux, TmuxError
 
 SHELL_WAIT = 5.0
+PANE_ECHO = 5      # seconds a just-typed line may take to show at the prompt
 
 
 def current_server(tmux):
@@ -44,6 +45,15 @@ def activate(tmux, window_id, pane_id=None):
     tmux("select-window", "-t", window_id, mutate=True)
     if pane_id:
         tmux("select-pane", "-t", pane_id, mutate=True)
+
+
+def prompt_line(tmux, pane_id):
+    """The logical line under the cursor (wrapped rows joined): what the shell prompt holds now.
+    Rows below the cursor are cut off, and so is everything above that line, so an old resume
+    line left in the scrollback never counts as typed."""
+    y = tmux("display-message", "-p", "-t", pane_id, "#{cursor_y}").strip()
+    rows = tmux("capture-pane", "-p", "-J", "-t", pane_id, "-E", y).rstrip("\n").split("\n")
+    return rows[-1]
 
 
 def lines_for(entry):
@@ -151,16 +161,20 @@ def restore_pane(key, pane_id, dry_run=False):
         raise typed.Refused("pane is gone; restore the window instead")
     if L.window_key(observe.boot8(paths.boot_id_file()), pid, start, window_id) != key:
         raise typed.Refused("that pane id now belongs to another window")
+    # From here on the pane is the right one, so every outcome starts by showing it: pressing
+    # restore again is always safe, and at worst it just takes you back to the line.
+    activate(tmux, window_id, pane_id)
     if command.strip() not in observe.SHELLS:
         raise typed.Refused("pane is busy (not at a shell prompt)")
     line = typed.resume_line(pane, entry.get("night_shift"), paths.claude_dir(), paths.proc_root())
     if line is None:
         raise typed.Refused("no Claude session recorded for this pane")
-    if not dry_run and not state.claim(d, f"pane:{key}:{pane_id}"):
-        raise typed.Refused("restore was just requested for this pane")
+    if f"--resume {pane['claude']['session_id']}" in prompt_line(tmux, pane_id):
+        return [], tmux.log                       # already typed and waiting for Enter
+    if not dry_run and not state.claim(d, f"pane:{key}:{pane_id}", window=PANE_ECHO):
+        return [], tmux.log                       # a click racing the previous line's echo
     if not type_line(tmux, pane_id, line):
         raise typed.Refused(f"pane not ready; type it yourself: {line}")
-    activate(tmux, window_id, pane_id)
     return [], tmux.log
 
 

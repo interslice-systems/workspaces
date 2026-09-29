@@ -261,13 +261,13 @@ PopupCard {
             anchors.left: parent.left
             anchors.leftMargin: Style.space(8)
             width: parent.width - Style.space(16) - buttons.width
-            // State is carried by WORDS and opacity, never hue alone (the name keeps its colour).
+            // A gone row is told apart by lightness (0.45), its restore/dismiss buttons (live rows
+            // have none) and its place after the live row -- never by hue (the name keeps its colour).
             text: rowRect.isTmux
               ? WorkspaceMenuModel.tmuxWindowLabel(rowRect.modelData.win.idx,
                                                    rowRect.modelData.win.name,
                                                    rowRect.modelData.win.state,
                                                    rowRect.modelData.win.bell)
-                + (rowRect.isGone ? " gone" : "")
               : (rowRect.isDismissAll ? "dismiss all gone"
                 : (rowRect.isRecorder ? rowRect.modelData.text
                   : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")

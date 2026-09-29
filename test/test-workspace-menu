@@ -393,7 +393,7 @@ assert_not_contains "no shell-string blackbox commands" 'run("ws-blackbox' "$wor
 assert_not_contains "no shell-string blackbox commands in menu" 'run("ws-blackbox' "$menu"
 assert_contains "tmux fetch never starts a server" '"tmux", "-N", "list-windows"' "$workspaces"
 assert_contains "ghosts suppressed when the live fetch is invalid or the boot id is unread" '(ws.tmuxLiveValid && ws.bootId8) ? ws.ledger : null' "$menu"
-assert_contains "gone rows say so in words" '" gone"' "$menu"
+assert_not_contains "gone rows are dimmed, not suffixed" '" gone"' "$menu"
 assert_not_contains "the window title stays clean when only its agent exited" '" agent gone"' "$menu"
 assert_contains "the exited agent is named in the caption" ' exited"]' "$plugin_dir/WorkspaceMenuModel.js"
 assert_contains "forgetting an exited agent keeps the window" 'card.ws.blackbox(["dismiss", "--agent", r.key, r.paneId])' "$menu"
