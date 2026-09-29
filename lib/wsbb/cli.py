@@ -179,7 +179,7 @@ def cmd_what(args):
             pids = set()
             for p in e["panes"]:
                 c = p.get("claude") or {}
-                kids = " · ".join(ch["cmd"] for ch in p.get("children", []))
+                kids = " · ".join(observe.child_label(ch) for ch in p.get("children", []))
                 label = f"claude \"{c.get('name')}\" ({c.get('status')})" if c else "no claude"
                 print(f"     pane {p['pane_id']}  {label}" + (f"  ·  {kids}" if kids else ""))
                 try:

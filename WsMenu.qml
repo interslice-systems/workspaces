@@ -200,7 +200,9 @@ PopupCard {
           readonly property string rowState: isTmux && modelData.row ? modelData.row.state : ""
           readonly property bool isGone: rowState === "gone"
           readonly property bool isAgentGone: rowState === "agent-gone"
-          readonly property string caption: isTmux && modelData.row ? modelData.row.caption : ""
+          readonly property var caption: isTmux && modelData.row && Array.isArray(modelData.row.caption)
+            ? modelData.row.caption : []
+          readonly property string longestCaption: caption.reduce(function(a, b) { return b.length > a.length ? b : a }, "")
           readonly property bool isGhostActions: modelData.kind === "ghost-actions"
           readonly property bool isDismissAll: modelData.kind === "dismiss-all"
           readonly property bool isRecorder: modelData.kind === "recorder"
@@ -211,7 +213,7 @@ PopupCard {
               ? Style.space(42) + Math.max(ffTitleMetrics.advanceWidth, ffUrlMetrics.advanceWidth)
               : (isGhostActions ? ghostActionsRow.implicitWidth + Style.space(8)
                 : Style.space(16) + buttons.width
-                  + Math.max(rowText.implicitWidth, captionText.visible ? captionText.implicitWidth + Style.space(12) : 0)))
+                  + Math.max(rowText.implicitWidth, captionText.visible ? captionMetrics.advanceWidth + Style.space(12) : 0)))
           implicitWidth: rowRect.naturalWidth
 
           TextMetrics {
@@ -276,22 +278,39 @@ PopupCard {
             renderType: Text.NativeRendering
           }
 
-          // What was running in the window, as of the recorder's last tick (read-only detail).
-          Text {
+          // What was running in the window, as of the recorder's last tick (read-only detail):
+          // one line per Claude session when there are several (captionLines decides). Each line
+          // is its own Text because Qt only middle-elides single-line text.
+          TextMetrics {
+            id: captionMetrics
+            font.family: card.ws.nerdFamily
+            font.pixelSize: Style.font.caption
+            text: rowRect.longestCaption
+          }
+
+          Column {
             id: captionText
-            visible: rowRect.caption !== ""
+            visible: rowRect.caption.length > 0
             anchors.top: rowText.bottom
             anchors.left: rowText.left
             anchors.leftMargin: Style.space(12)
             width: rowText.width - Style.space(12)
-            text: rowRect.caption
-            textFormat: Text.PlainText
-            color: Color.foreground
-            opacity: rowRect.isGone ? 0.35 : 0.6
-            font.family: card.ws.nerdFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideMiddle
-            renderType: Text.NativeRendering
+
+            Repeater {
+              model: rowRect.caption
+              Text {
+                required property string modelData
+                width: captionText.width
+                text: modelData
+                textFormat: Text.PlainText
+                color: Color.foreground
+                opacity: rowRect.isGone ? 0.35 : 0.6
+                font.family: card.ws.nerdFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideMiddle
+                renderType: Text.NativeRendering
+              }
+            }
           }
 
           Item {

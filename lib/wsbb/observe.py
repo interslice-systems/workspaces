@@ -96,6 +96,25 @@ def observe_now():
         return None, True
 
 
+def _presence(procs, pid, sessions_dir):
+    """The Claude presence file for this exact process (pid AND procStart match), or None."""
+    info = procs.get(pid)
+    if info is None or sessions_dir is None:
+        return None
+    try:
+        data = json.loads((Path(sessions_dir) / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or str(data.get("procStart")) != str(info["start"]):
+        return None
+    return data
+
+
+def _short_field(data, field):
+    value = data.get(field)
+    return value[:80] if isinstance(value, str) else None
+
+
 def claude_for_pane(procs, pane_pid, sessions_dir):
     if procs is None:
         return None
@@ -104,21 +123,23 @@ def claude_for_pane(procs, pane_pid, sessions_dir):
         if info is None or info["comm"] != "claude":
             continue
         block = {"session_id": None, "name": None, "status": None, "pid": pid}
-        try:
-            data = json.loads((Path(sessions_dir) / f"{pid}.json").read_text())
-        except (OSError, ValueError):
-            return block
-        if not isinstance(data, dict) or str(data.get("procStart")) != str(info["start"]):
+        data = _presence(procs, pid, sessions_dir)
+        if data is None:
             return block
         sid = data.get("sessionId")
         if isinstance(sid, str) and UUID_RE.match(sid):
             block["session_id"] = sid
-        for field in ("name", "status"):
-            value = data.get(field)
-            if isinstance(value, str):
-                block[field] = value[:80]
+        block["name"] = _short_field(data, "name")
+        block["status"] = _short_field(data, "status")
         return block
     return None
+
+
+def claude_plumbing(info):
+    """Claude Code's background-agent machinery: the daemon, pty hosts, the warm spare.
+    Not conversations -- never listed, but walked through to the sessions they host."""
+    argv = info["argv"]
+    return argv[1:2] == ["daemon"] or any(a in ("--bg-pty-host", "--bg-spare") for a in argv)
 
 
 def short_cmd(info):
@@ -147,7 +168,7 @@ def _ignored(info):
     return info["comm"] in IGNORED_COMMS or "mcp" in " ".join(info["argv"]).lower()
 
 
-def children_for_pane(procs, pane_pid):
+def children_for_pane(procs, pane_pid, sessions_dir=None):
     if procs is None:
         return []
     out = []
@@ -160,10 +181,20 @@ def children_for_pane(procs, pane_pid):
             for kid in procs.children(pid):
                 visit(kid, False)
             return
+        if info["comm"] == "claude" and claude_plumbing(info):
+            for kid in procs.children(pid):
+                visit(kid, True)
+            return
         age = procs.age(pid)
         if age is None or age < MIN_CHILD_AGE:
             return
-        out.append({"comm": info["comm"], "cmd": short_cmd(info)})
+        entry = {"comm": info["comm"], "cmd": short_cmd(info)}
+        if info["comm"] == "claude":
+            entry["cmd"] = "claude"
+            data = _presence(procs, pid, sessions_dir)
+            if data is not None:
+                entry["session"] = {f: _short_field(data, f) for f in ("name", "status", "kind")}
+        out.append(entry)
         if info["comm"] == "claude":
             for kid in procs.children(pid):
                 visit(kid, True)
@@ -192,9 +223,21 @@ def group_windows(rows, procs, sessions_dir):
             "pane_id": r["pane_id"], "index": r["pane_index"], "cwd": r["cwd"],
             "pid": r["pane_pid"], "command": r["command"],
             "claude": claude_for_pane(procs, r["pane_pid"], sessions_dir),
-            "children": children_for_pane(procs, r["pane_pid"]),
+            "children": children_for_pane(procs, r["pane_pid"], sessions_dir),
         })
     for w in windows.values():
         w["panes"].sort(key=lambda p: p["index"])
         w["night_shift"] = night_shift(w["name"], [p["cwd"] for p in w["panes"]])
     return sorted(windows.values(), key=lambda w: (w["session"], w["index"]))
+
+
+def child_label(child):
+    """One human line for a recorded child: `claude <name> · <status>`, `background …`, or the cmd."""
+    session = child.get("session") if isinstance(child.get("session"), dict) else None
+    if not session:
+        return str(child.get("cmd") or child.get("comm") or "")
+    head = "background" if session.get("kind") == "bg" else "claude"
+    parts = [" ".join(p for p in (head, session.get("name")) if p)]
+    if session.get("status"):
+        parts.append(session["status"])
+    return " · ".join(parts)

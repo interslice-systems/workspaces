@@ -493,7 +493,7 @@ TestCase {
     compare(rows.length, 2)
     compare(rows[0].state, "agent-gone")
     compare(rows[0].paneId, "%1")
-    compare(rows[0].caption, "claude · ruby bin/dev")
+    compare(rows[0].caption, ["claude · ruby bin/dev"])
     compare(rows[1].state, "gone")
     compare(rows[1].win.name, "b")
   }
@@ -554,5 +554,19 @@ TestCase {
     verify(parsed.valid)
     compare(parsed.bySession["__proto__"].length, 1)
     compare(parsed.bySession["constructor"].length, 1)
+  }
+
+  function test_caption_lines_one_claude_inline_several_on_their_own_lines() {
+    var one = {panes: [{children: [
+      {cmd: "claude", session: {name: "mirepoix-ios", status: "idle", kind: "interactive"}},
+      {cmd: "ruby bin/dev"}]}]}
+    compare(Model.captionLines(one), ["claude mirepoix-ios · idle · ruby bin/dev"])
+    var two = {panes: [{children: [
+      {cmd: "claude", session: {name: "android-21", status: "busy", kind: "interactive"}},
+      {cmd: "claude", session: {name: "android", status: "idle", kind: "bg"}},
+      {cmd: "npm run dev"}]}]}
+    compare(Model.captionLines(two), ["claude android-21 · busy", "background android · idle", "npm run dev"])
+    compare(Model.captionLines({panes: [{children: []}]}), [])
+    compare(Model.captionLines(null), [])
   }
 }

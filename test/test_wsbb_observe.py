@@ -115,6 +115,38 @@ class ChildrenTest(unittest.TestCase):
             kids = observe.children_for_pane(ProcTable(Path(tmp)), 10)
             self.assertEqual([k["cmd"] for k in kids], ["claude", "ruby bin/dev"])
 
+    def test_claude_sessions_are_labelled_and_plumbing_is_hidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = FakeProc(Path(tmp) / "proc")
+            sessions = Path(tmp) / "sessions"
+            sessions.mkdir()
+            fp.add(10, 1, "bash", ["-bash"])
+            main = fp.add(11, 10, "claude", ["claude", "--permission-mode", "auto"])
+            fp.add(20, 11, "claude", ["claude", "daemon", "run", "--origin", "transient"])
+            fp.add(21, 20, "claude", ["claude", "--bg-pty-host", "/tmp/x.sock", "120", "51", "--", "claude"])
+            bg = fp.add(22, 21, "claude", ["claude", "--session-id", UUID, "--fork-session"])
+            fp.add(23, 20, "claude", ["claude", "--bg-pty-host", "/tmp/y.sock", "200", "50"])
+            fp.add(24, 23, "claude", ["claude", "--bg-spare", "/tmp/z.sock"])
+            (sessions / "11.json").write_text(json.dumps(
+                {"pid": 11, "procStart": str(main), "sessionId": UUID, "name": "main-21",
+                 "status": "busy", "kind": "interactive"}))
+            (sessions / "22.json").write_text(json.dumps(
+                {"pid": 22, "procStart": str(bg), "sessionId": UUID, "name": "bgjob",
+                 "status": "idle", "kind": "bg"}))
+            kids = observe.children_for_pane(ProcTable(fp.root), 10, sessions)
+            self.assertEqual(kids, [
+                {"comm": "claude", "cmd": "claude", "session": {"name": "main-21", "status": "busy", "kind": "interactive"}},
+                {"comm": "claude", "cmd": "claude", "session": {"name": "bgjob", "status": "idle", "kind": "bg"}},
+            ])
+
+    def test_child_label(self):
+        self.assertEqual(observe.child_label({"cmd": "claude", "session": {"name": "bgjob", "status": "idle", "kind": "bg"}}),
+                         "background bgjob \u00b7 idle")
+        self.assertEqual(observe.child_label({"cmd": "claude", "session": {"name": "m-21", "status": "busy", "kind": "interactive"}}),
+                         "claude m-21 \u00b7 busy")
+        self.assertEqual(observe.child_label({"cmd": "claude", "session": {"name": None, "status": None, "kind": None}}), "claude")
+        self.assertEqual(observe.child_label({"cmd": "ruby bin/dev"}), "ruby bin/dev")
+
     def test_short_cmd_never_keeps_credential_shaped_words(self):
         cred = "gh" + "p_" + "A" * 36
         info = {"comm": "curl", "argv": ["curl", "-H", cred, "https://example.test/x"]}

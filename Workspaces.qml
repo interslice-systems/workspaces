@@ -743,9 +743,15 @@ BarWidget {
         readonly property bool focused: !ghost && ws.focused
         readonly property bool urgent: !ghost && ws.urgent
         readonly property string key: ghost ? modelData.name : root.wsKey(ws)
-        readonly property string flatLabel: ghost
+        // The pill whose window menu is open gets a caret and an underline, so the card below
+        // always reads as belonging to it -- shape, not hue.
+        readonly property bool menuOpen: wsMenu.open && (ghost
+          ? (wsMenu.targetGhost !== null && wsMenu.targetGhost.name === modelData.name)
+          : wsMenu.targetWs === ws)
+        readonly property string caret: (entry.menuOpen ? " \u25be" : "")
+        readonly property string flatLabel: (ghost
           ? WorkspaceMenuModel.wsBarLabel(modelData.id, modelData.name, false)
-          : root.wsLabel(ws, urgent)
+          : root.wsLabel(ws, urgent)) + caret
 
         width: focused ? pill.implicitWidth : flat.implicitWidth
         height: root.barSize
@@ -754,7 +760,7 @@ BarWidget {
           id: pill
           anchors.verticalCenter: parent.verticalCenter
           visible: entry.focused
-          label: entry.ghost ? "" : root.wsLabel(entry.ws, false)
+          label: entry.ghost ? "" : root.wsLabel(entry.ws, false) + entry.caret
           color: root.fillFor(entry.key)
           textColor: root.fillTextFor(entry.key)
         }
@@ -789,6 +795,16 @@ BarWidget {
             font.bold: true
             renderType: Text.NativeRendering
           }
+        }
+
+        Rectangle {
+          visible: entry.menuOpen
+          anchors.horizontalCenter: parent.horizontalCenter
+          anchors.bottom: parent.bottom
+          width: Math.max(0, entry.width - root.roundPad)
+          height: Math.max(2, Style.space(2))
+          radius: height / 2
+          color: entry.focused ? root.fillFor(entry.key) : root.flatFgFor(entry.key)
         }
 
         MouseArea {

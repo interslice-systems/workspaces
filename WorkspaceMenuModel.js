@@ -361,18 +361,36 @@ function liveKeySet(boot8, bySession) {
   return out
 }
 
-function childrenCaption(entry) {
-  if (!entry || !Array.isArray(entry.panes)) return ""
+function childLabel(child) {
+  var session = child && isPlainObject(child.session) ? child.session : null
+  if (!session) return child && typeof child.cmd === "string" ? child.cmd : ""
+  var head = session.kind === "bg" ? "background" : "claude"
+  var first = typeof session.name === "string" && session.name ? head + " " + session.name : head
+  return typeof session.status === "string" && session.status ? first + " \u00b7 " + session.status : first
+}
+
+// What ran in a window, as display lines: one Claude session stays inline with the other
+// processes; several each get their own line, with the other processes on a last line.
+function captionLines(entry) {
+  if (!entry || !Array.isArray(entry.panes)) return []
   var seen = Object.create(null)
-  var words = []
+  var claudes = []
+  var others = []
   for (var i = 0; i < entry.panes.length; i++) {
     var kids = entry.panes[i] && Array.isArray(entry.panes[i].children) ? entry.panes[i].children : []
     for (var j = 0; j < kids.length; j++) {
-      var c = kids[j] && typeof kids[j].cmd === "string" ? kids[j].cmd : ""
-      if (c && !seen[c]) { seen[c] = true; words.push(c) }
+      var label = childLabel(kids[j])
+      if (!label || seen[label]) continue
+      seen[label] = true
+      if (kids[j].cmd === "claude") claudes.push(label)
+      else others.push(label)
     }
   }
-  return words.join(" · ")
+  if (claudes.length <= 1) {
+    var inline = claudes.concat(others).join(" \u00b7 ")
+    return inline ? [inline] : []
+  }
+  return others.length ? claudes.concat([others.join(" \u00b7 ")]) : claudes
 }
 
 function mergeWindows(liveRows, liveKeys, ledger, workspaceName, boot8) {
@@ -383,7 +401,7 @@ function mergeWindows(liveRows, liveKeys, ledger, workspaceName, boot8) {
     var w = live[i]
     var key = (boot8 && w.windowId) ? blackboxKey(boot8, w.serverPid, w.serverStart, w.windowId) : ""
     var entry = key && windows[key] ? windows[key] : null
-    var row = {state: "live", win: w, key: key, paneId: "", caption: childrenCaption(entry)}
+    var row = {state: "live", win: w, key: key, paneId: "", caption: captionLines(entry)}
     if (entry && w.paneCommands) {
       for (var j = 0; j < entry.panes.length; j++) {
         var p = entry.panes[j]
@@ -402,7 +420,7 @@ function mergeWindows(liveRows, liveKeys, ledger, workspaceName, boot8) {
       var e = windows[keys[k]]
       if (liveKeys[keys[k]] === true || e.restored_to) continue
       if (!e.workspace || e.workspace.name !== workspaceName) continue
-      rows.push({state: "gone", key: keys[k], paneId: "", caption: childrenCaption(e),
+      rows.push({state: "gone", key: keys[k], paneId: "", caption: captionLines(e),
                  win: {session: e.session, idx: e.index, name: e.name, bell: false, state: ""}})
     }
   }
