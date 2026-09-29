@@ -399,6 +399,9 @@ assert_contains "bar interleaves ghost pills" 'WorkspaceMenuModel.barEntries(roo
 assert_contains "ghost pills are outlined, not filled" 'border.width: 1' "$workspaces"
 assert_contains "stale glyph only when the recorder is installed" 'root.recorder.installed && root.recorder.stale' "$workspaces"
 
+assert_multiline "a failed tmux refresh keeps the previous live rows" \
+  $'    if (!parsed.valid) {\n      root.tmuxLiveValid = false\n      root.tmuxWindowsReady = true\n      root.finishTmuxRefresh()\n      return\n    }' "$workspaces"
+
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"
   exit 1

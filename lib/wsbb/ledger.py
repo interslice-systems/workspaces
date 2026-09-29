@@ -27,6 +27,11 @@ def merge_claude(old, new, now):
     if new.get("session_id") is None and old and old.get("pid") == new.get("pid"):
         return old
     merged = dict(new)
+    if merged.get("session_id") is None and old and old.get("session_id"):
+        # A new claude whose presence file can't be joined (yet, or ever) keeps the known
+        # identity; only a DIFFERENT valid session id replaces it.
+        merged["session_id"] = old["session_id"]
+        merged["name"] = merged.get("name") or old.get("name")
     merged["last_seen"] = now
     return merged
 

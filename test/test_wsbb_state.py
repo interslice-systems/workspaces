@@ -53,6 +53,21 @@ class StateTest(unittest.TestCase):
         self.assertEqual(problem, "ledger-corrupt")
         self.assertTrue((d / state.LEDGER).exists())
 
+    def test_malformed_entry_makes_the_ledger_corrupt(self):
+        d = state.ensure_state_dir()
+        bad = {"version": 1, "workspaces": {}, "windows": {"k": {"index": "x", "panes": "nope"}}}
+        (d / state.LEDGER).write_text(json.dumps(bad))
+        ledger, problem = state.load_ledger(d, 9, repair=True)
+        self.assertEqual(problem, "ledger-corrupt")
+        self.assertTrue((d / "ledger.json.corrupt-9").exists())
+
+    def test_claim_refuses_a_repeat_within_the_window(self):
+        d = state.ensure_state_dir()
+        self.assertTrue(state.claim(d, "pane:k:%1", now=100))
+        self.assertFalse(state.claim(d, "pane:k:%1", now=110))
+        self.assertTrue(state.claim(d, "pane:k:%2", now=110))
+        self.assertTrue(state.claim(d, "pane:k:%1", now=200))
+
     def test_lock_times_out_when_held(self):
         d = state.ensure_state_dir()
         with state.locked(d):

@@ -284,11 +284,26 @@ function parseLedger(raw) {
   var keys = Object.keys(doc.windows)
   for (var i = 0; i < keys.length; i++) {
     var e = doc.windows[keys[i]]
-    if (!isPlainObject(e) || !isInteger(e.index) || typeof e.name !== "string"
-        || typeof e.session !== "string" || !Array.isArray(e.panes)) continue
-    windows[keys[i]] = e
+    if (validLedgerWindow(e)) windows[keys[i]] = e
   }
   return {windows: windows, workspaces: doc.workspaces}
+}
+
+// Every field the merge and the menu read is checked here, so a malformed entry is dropped
+// instead of throwing (or rendering) further down.
+function validLedgerWindow(e) {
+  if (!isPlainObject(e) || !isInteger(e.index) || typeof e.name !== "string"
+      || typeof e.session !== "string" || !Array.isArray(e.panes)) return false
+  if (e.workspace !== null && e.workspace !== undefined
+      && (!isPlainObject(e.workspace) || typeof e.workspace.name !== "string"
+          || !isInteger(e.workspace.id))) return false
+  for (var i = 0; i < e.panes.length; i++) {
+    var p = e.panes[i]
+    if (!isPlainObject(p) || typeof p.pane_id !== "string") return false
+    if (p.claude !== null && p.claude !== undefined && !isPlainObject(p.claude)) return false
+    if (p.children !== undefined && !Array.isArray(p.children)) return false
+  }
+  return true
 }
 
 function parseHeartbeat(raw) {
@@ -316,7 +331,7 @@ function isNoServer(err) {
 }
 
 function parseTmuxWindows(exitCode, out, err) {
-  var map = {}
+  var map = Object.create(null)
   if (exitCode !== 0) return {bySession: map, valid: isNoServer(err)}
   var lines = String(out || "").split("\n")
   for (var i = 0; i < lines.length; i++) {

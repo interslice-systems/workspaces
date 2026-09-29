@@ -56,10 +56,21 @@ def read_json(path, default):
         return default
 
 
+def _valid_window(e):
+    return (isinstance(e, dict) and isinstance(e.get("index"), int)
+            and isinstance(e.get("name"), str) and isinstance(e.get("session"), str)
+            and isinstance(e.get("panes"), list)
+            and all(isinstance(p, dict) and isinstance(p.get("pane_id"), str)
+                    and isinstance(p.get("cwd"), str) for p in e["panes"]))
+
+
 def _valid(data):
     return (isinstance(data, dict) and data.get("version") == 1
             and isinstance(data.get("windows"), dict)
-            and isinstance(data.get("workspaces"), dict))
+            and isinstance(data.get("workspaces"), dict)
+            and all(_valid_window(e) for e in data["windows"].values())
+            and all(isinstance(w, dict) and isinstance(w.get("id"), int)
+                    for w in data["workspaces"].values()))
 
 
 def load_ledger(directory, now, repair):
@@ -93,3 +104,27 @@ def locked(directory, timeout=15.0):
         yield
     finally:
         os.close(fd)
+
+
+RECENT = "recent.json"
+CLAIM_WINDOW = 30
+
+
+def claim(directory, action, now=None, window=CLAIM_WINDOW):
+    """True the first time `action` is claimed within `window` seconds; False for a repeat.
+    Makes a double-click on restore a no-op instead of a second window or a doubled line."""
+    now = int(time.time()) if now is None else now
+    d = Path(directory)
+    with locked(d):
+        try:
+            recent = read_json(d / RECENT, {})
+        except ValueError:
+            recent = {}
+        if not isinstance(recent, dict):
+            recent = {}
+        recent = {k: v for k, v in recent.items() if isinstance(v, int) and now - v < window}
+        if action in recent:
+            return False
+        recent[action] = now
+        atomic_write_json(d / RECENT, recent)
+        return True

@@ -137,6 +137,21 @@ class RestoreIntegrationTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue(self.wait(lambda: f"claude --resume {UUID}" in self.tmux("capture-pane", "-p", "-t", pane)))
 
+    def test_double_click_on_agent_gone_types_once(self):
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        pane = self.ledger()["windows"][key]["panes"][0]["pane_id"]
+        os.kill(kid, 15)
+        self.assertTrue(self.wait(lambda: self.tmux("display-message", "-p", "-t", pane,
+                                                    "#{pane_current_command}").strip() == "bash"))
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        second = self.bb("restore", "--pane", key, pane)
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("just", second.stderr)
+        time.sleep(0.3)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-t", pane).count("claude --resume"), 1)
+
     def test_live_session_is_refused(self):
         self.start_agent_window()
         self.bb("tick")

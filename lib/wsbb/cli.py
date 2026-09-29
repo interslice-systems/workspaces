@@ -77,6 +77,8 @@ def cmd_tick(args):
                 prev = state.read_json(d / state.HEARTBEAT, {})
             except ValueError:
                 prev = {}
+            if not isinstance(prev, dict):
+                prev = {}
             state.atomic_write_json(d / state.HEARTBEAT, {
                 "last_attempt": now,
                 "last_full": now if not partial else prev.get("last_full"),

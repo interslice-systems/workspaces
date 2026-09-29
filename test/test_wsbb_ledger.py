@@ -84,6 +84,16 @@ class UpsertTest(unittest.TestCase):
         self.assertEqual(led["windows"]["b00b1e55:7:70:@1"]["workspace"], {"id": 2, "name": "s"})
 
 
+class ReviewFixesTest(unittest.TestCase):
+    def test_new_claude_with_unknown_id_keeps_known_id(self):
+        led = empty()
+        L.upsert(led, obs(window(claude={"session_id": UUID_A, "name": "n", "status": "idle", "pid": 5})), 1000)
+        L.upsert(led, obs(window(claude={"session_id": None, "name": None, "status": None, "pid": 6})), 1100)
+        c = led["windows"]["b00b1e55:7:70:@1"]["panes"][0]["claude"]
+        self.assertEqual(c["session_id"], UUID_A)
+        self.assertEqual(c["pid"], 6)
+
+
 class LiveAndDismissTest(unittest.TestCase):
     def test_ghosts_and_workspace_dismiss(self):
         led = empty()
@@ -108,6 +118,22 @@ class TickTest(unittest.TestCase):
             hb = json.loads(Path(f"{tmp}/state/heartbeat.json").read_text())
             self.assertEqual(hb["partial_sources"], [])
             self.assertEqual(hb["last_full"], hb["last_attempt"])
+
+    def test_tick_recovers_from_a_wrong_typed_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(f"{tmp}/state").mkdir(mode=0o700)
+            Path(f"{tmp}/state/heartbeat.json").write_text("[]\n")
+            Path(f"{tmp}/state/ledger.json").write_text("{corrupt")   # forces a PARTIAL tick
+            env = dict(os.environ, WS_BLACKBOX_STATE=f"{tmp}/state", TMUX_TMPDIR=tmp,
+                       WS_BLACKBOX_CLIENTS="/bin/false")
+            env.pop("TMUX", None)
+            res = subprocess.run([sys.executable, str(REPO / "bin/ws-blackbox"), "tick"],
+                                 env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            hb = json.loads(Path(f"{tmp}/state/heartbeat.json").read_text())
+            self.assertIsInstance(hb, dict)
+            self.assertEqual(hb["partial_sources"], ["ledger-corrupt"])
+            self.assertIsNone(hb["last_full"])
 
 
 if __name__ == "__main__":

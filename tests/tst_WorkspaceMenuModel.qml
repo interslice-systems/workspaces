@@ -533,4 +533,26 @@ TestCase {
     compare(stale.text, "recorder stopped · 12m")
     verify(Model.recorderStatus({last_full: null}, 1000).stale)
   }
+
+  function test_parse_ledger_drops_malformed_nested_entries() {
+    var raw = JSON.stringify({version: 1, workspaces: {}, windows: {
+      "ok": {session: "s", index: 1, name: "a", workspace: {id: 1, name: "s"}, panes: [{pane_id: "%1", claude: null, children: []}]},
+      "badpane": {session: "s", index: 2, name: "b", workspace: null, panes: [5]},
+      "badws": {session: "s", index: 3, name: "c", workspace: {id: "x", name: 3}, panes: []},
+      "badkids": {session: "s", index: 4, name: "d", workspace: null, panes: [{pane_id: "%4", claude: null, children: "no"}]},
+      "badclaude": {session: "s", index: 5, name: "e", workspace: null, panes: [{pane_id: "%5", claude: 7, children: []}]}
+    }})
+    var l = Model.parseLedger(raw)
+    compare(Object.keys(l.windows), ["ok"])
+  }
+
+  function test_parse_tmux_windows_survives_prototype_session_names() {
+    var lines = ["__proto__", "constructor"].map(function(name) {
+      return [name, "1", "w", "0", "@1", "7", "70", "%1=bash;", "|"].join("\u001f")
+    }).join("\n")
+    var parsed = Model.parseTmuxWindows(0, lines, "")
+    verify(parsed.valid)
+    compare(parsed.bySession["__proto__"].length, 1)
+    compare(parsed.bySession["constructor"].length, 1)
+  }
 }

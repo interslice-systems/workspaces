@@ -150,7 +150,7 @@ BarWidget {
   readonly property var ghostList: WorkspaceMenuModel.ghostWorkspaces(root.ledger, root.liveWorkspaceNames())
 
   function liveWorkspaceNames() {
-    var out = {}
+    var out = Object.create(null)
     var list = root.workspaceList()
     for (var i = 0; i < list.length; i++) {
       var nm = root.wsName(list[i])
@@ -276,6 +276,12 @@ BarWidget {
   function finishTmuxWindows() {
     if (!root.tmuxWinOutReady || !root.tmuxWinErrReady || !root.tmuxWinExitReady) return
     var parsed = WorkspaceMenuModel.parseTmuxWindows(root.tmuxWinExitCode, root.tmuxWinOut, root.tmuxWinErr)
+    if (!parsed.valid) {
+      root.tmuxLiveValid = false
+      root.tmuxWindowsReady = true
+      root.finishTmuxRefresh()
+      return
+    }
     root.tmuxWindows = parsed.bySession
     root.tmuxLiveValid = parsed.valid
     root.tmuxLiveKeys = WorkspaceMenuModel.liveKeySet(root.bootId8, parsed.bySession)

@@ -147,6 +147,8 @@ def restore_pane(key, pane_id, dry_run=False):
     line = typed.resume_line(pane, entry.get("night_shift"), paths.claude_dir(), paths.proc_root())
     if line is None:
         raise typed.Refused("no Claude session recorded for this pane")
+    if not dry_run and not state.claim(d, f"pane:{key}:{pane_id}"):
+        raise typed.Refused("restore was just requested for this pane")
     if not type_line(tmux, pane_id, line):
         raise typed.Refused(f"pane not ready; type it yourself: {line}")
     return [], tmux.log
@@ -253,6 +255,8 @@ def restore_workspace(name, dry_run=False):
     dispatch = spawn_dispatch(ws_id, paths.self_path(), restore_id)
     if dry_run:
         return [], [["hyprctl", "dispatch", dispatch]]
+    if not state.claim(d, f"workspace:{name}"):
+        raise typed.Refused(f"restore was just requested for '{name}'")
     for old in d.glob("spawn-*.json"):
         if now - old.stat().st_mtime > 3600:
             old.unlink(missing_ok=True)
