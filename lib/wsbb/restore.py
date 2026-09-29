@@ -38,6 +38,14 @@ def type_line(tmux, pane_id, line):
     return True
 
 
+def activate(tmux, window_id, pane_id=None):
+    """Make the restored window (and pane) the session's current one, so the typed line is in
+    front of whoever looks at that session. select-window, never switch-client."""
+    tmux("select-window", "-t", window_id, mutate=True)
+    if pane_id:
+        tmux("select-pane", "-t", pane_id, mutate=True)
+
+
 def lines_for(entry):
     out = []
     for pane in entry["panes"]:
@@ -116,6 +124,7 @@ def restore_window(key, dry_run=False):
             entry["restored_to"] = L.window_key(boot, pid, start, window_id)
             state.atomic_write_json(d / state.LEDGER, led)
     notes = finish_window(tmux, entry, window_id, pane_ids)
+    activate(tmux, window_id)
     if not dry_run:
         with state.locked(d):
             led = _load_for_restore(d)
@@ -151,6 +160,7 @@ def restore_pane(key, pane_id, dry_run=False):
         raise typed.Refused("restore was just requested for this pane")
     if not type_line(tmux, pane_id, line):
         raise typed.Refused(f"pane not ready; type it yourself: {line}")
+    activate(tmux, window_id, pane_id)
     return [], tmux.log
 
 

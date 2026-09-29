@@ -267,7 +267,7 @@ PopupCard {
                                                    rowRect.modelData.win.name,
                                                    rowRect.modelData.win.state,
                                                    rowRect.modelData.win.bell)
-                + (rowRect.isGone ? " gone" : (rowRect.isAgentGone ? " agent gone" : ""))
+                + (rowRect.isGone ? " gone" : "")
               : (rowRect.isDismissAll ? "dismiss all gone"
                 : (rowRect.isRecorder ? rowRect.modelData.text
                   : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")
@@ -464,7 +464,7 @@ PopupCard {
             visible: rowRect.isGone || rowRect.isAgentGone
             Repeater {
               model: rowRect.isGone ? (card.targetGhost ? ["dismiss"] : ["restore", "dismiss"])
-                : (rowRect.isAgentGone ? ["restore"] : [])
+                : (rowRect.isAgentGone ? ["restore", "dismiss"] : [])
               Item {
                 id: btn
                 required property string modelData
@@ -490,9 +490,17 @@ PopupCard {
                   cursorShape: Qt.PointingHandCursor
                   onClicked: {
                     var r = rowRect.modelData.row
-                    if (btn.modelData === "dismiss") card.ws.blackbox(["dismiss", r.key])
-                    else if (r.state === "agent-gone") card.ws.blackbox(["restore", "--pane", r.key, r.paneId])
-                    else card.ws.blackbox(["restore", r.key])
+                    if (btn.modelData === "dismiss") {
+                      // agent-gone: forget the exited Claude, keep the (live) window
+                      if (r.state === "agent-gone") card.ws.blackbox(["dismiss", "--agent", r.key, r.paneId])
+                      else card.ws.blackbox(["dismiss", r.key])
+                    } else {
+                      if (r.state === "agent-gone") card.ws.blackbox(["restore", "--pane", r.key, r.paneId])
+                      else card.ws.blackbox(["restore", r.key])
+                      // ws-blackbox selects the restored tmux window; bring its workspace forward
+                      card.ws.focusWorkspace(card.targetId)
+                      card.close()
+                    }
                   }
                 }
               }

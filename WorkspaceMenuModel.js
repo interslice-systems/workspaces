@@ -371,7 +371,7 @@ function childLabel(child) {
 
 // What ran in a window, as display lines: one Claude session stays inline with the other
 // processes; several each get their own line, with the other processes on a last line.
-function captionLines(entry) {
+function captionLines(entry, withoutClaudes) {
   if (!entry || !Array.isArray(entry.panes)) return []
   var seen = Object.create(null)
   var claudes = []
@@ -382,7 +382,7 @@ function captionLines(entry) {
       var label = childLabel(kids[j])
       if (!label || seen[label]) continue
       seen[label] = true
-      if (kids[j].cmd === "claude") claudes.push(label)
+      if (kids[j].cmd === "claude") { if (!withoutClaudes) claudes.push(label) }
       else others.push(label)
     }
   }
@@ -406,8 +406,12 @@ function mergeWindows(liveRows, liveKeys, ledger, workspaceName, boot8) {
       for (var j = 0; j < entry.panes.length; j++) {
         var p = entry.panes[j]
         if (p && p.claude && p.claude.session_id && LEDGER_SHELLS[w.paneCommands[p.pane_id]] === true) {
+          // The window is fine; its CONTENTS (the Claude) exited. Say so in the caption, where
+          // restore/forget act on it, and drop the dead Claude's stale child entries.
           row.state = "agent-gone"
           row.paneId = String(p.pane_id)
+          var who = typeof p.claude.name === "string" && p.claude.name ? "claude " + p.claude.name : "claude"
+          row.caption = [who + " \u00b7 exited"].concat(captionLines(entry, true))
           break
         }
       }

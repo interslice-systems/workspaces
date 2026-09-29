@@ -493,7 +493,7 @@ TestCase {
     compare(rows.length, 2)
     compare(rows[0].state, "agent-gone")
     compare(rows[0].paneId, "%1")
-    compare(rows[0].caption, ["claude · ruby bin/dev"])
+    compare(rows[0].caption, ["claude · exited", "ruby bin/dev"])
     compare(rows[1].state, "gone")
     compare(rows[1].win.name, "b")
   }
@@ -584,5 +584,16 @@ TestCase {
     compare(Model.openLabel("2\u00b7mirepoix-native", false), "2\u00b7mirepoix-native")
     compare(Model.openLabel("1\u00b7\uf0f3 mirepoix", true), "1\u25be\uf0f3 mirepoix")
     compare(Model.openLabel("7", true), "7")
+  }
+
+  function test_agent_gone_caption_names_the_exited_claude() {
+    var l = Model.parseLedger(JSON.stringify({version: 1, workspaces: {}, windows: {
+      "b00b1e55:7:70:@1": {session: "s", index: 1, name: "w", workspace: {id: 1, name: "s"}, restored_to: null,
+        panes: [{pane_id: "%1", claude: {session_id: "u1", name: "home-folder-test"},
+                 children: [{cmd: "claude", session: {name: "home-folder-test", status: "idle", kind: "interactive"}}]}]}}}))
+    var live = [{session: "s", idx: 1, name: "w", windowId: "@1", serverPid: "7", serverStart: "70", paneCommands: {"%1": "bash"}}]
+    var rows = Model.mergeWindows(live, Model.liveKeySet("b00b1e55", {"s": live}), l, "s", "b00b1e55")
+    compare(rows[0].state, "agent-gone")
+    compare(rows[0].caption, ["claude home-folder-test · exited"])
   }
 }

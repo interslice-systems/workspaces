@@ -25,6 +25,7 @@ def build_parser():
     dismiss = sub.add_parser("dismiss", help="forget a gone window or workspace")
     dismiss.add_argument("key", nargs="?")
     dismiss.add_argument("--workspace")
+    dismiss.add_argument("--agent", nargs=2, metavar=("KEY", "PANE_ID"))
     restore = sub.add_parser("restore", help="rebuild a gone window, pane, or workspace")
     restore.add_argument("key", nargs="?")
     restore.add_argument("--pane", nargs=2, metavar=("KEY", "PANE_ID"))
@@ -218,7 +219,9 @@ def cmd_dismiss(args):
         if problem:
             print("ledger unreadable", file=sys.stderr)
             return 1
-        if args.workspace:
+        if args.agent:
+            n = 1 if ledger_mod.forget_agent(led, args.agent[0], args.agent[1]) else 0
+        elif args.workspace:
             rows, error = observe.observe_now()
             if error:
                 print("tmux query failed", file=sys.stderr)

@@ -87,3 +87,16 @@ def dismiss_workspace(ledger, name, live):
     if not any((e.get("workspace") or {}).get("name") == name for e in ledger["windows"].values()):
         ledger["workspaces"].pop(name, None)
     return removed
+
+
+def forget_agent(ledger, key, pane_id):
+    """The pane's Claude was exited on purpose: drop the remembered block so the window stops
+    offering a resume. The window itself stays tracked."""
+    entry = ledger["windows"].get(key)
+    if entry is None:
+        return False
+    for pane in entry.get("panes", []):
+        if pane.get("pane_id") == pane_id and pane.get("claude"):
+            pane["claude"] = None
+            return True
+    return False

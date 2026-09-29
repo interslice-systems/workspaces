@@ -152,6 +152,46 @@ class RestoreIntegrationTest(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.tmux("capture-pane", "-p", "-t", pane).count("claude --resume"), 1)
 
+    def active_window(self):
+        rows = self.tmux("list-windows", "-t", f"={SESSION}", "-F", "#{window_active} #{window_index}").split("\n")
+        return next(r.split()[1] for r in rows if r.startswith("1 "))
+
+    def test_pane_restore_activates_its_window(self):
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        pane = self.ledger()["windows"][key]["panes"][0]["pane_id"]
+        self.assertNotEqual(self.active_window(), "5")
+        os.kill(kid, 15)
+        self.assertTrue(self.wait(lambda: self.tmux("display-message", "-p", "-t", pane,
+                                                    "#{pane_current_command}").strip() == "bash"))
+        self.assertEqual(self.bb("restore", "--pane", key, pane).returncode, 0)
+        self.assertEqual(self.active_window(), "5")
+
+    def test_window_restore_activates_the_new_window(self):
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        os.kill(kid, 15)
+        self.tmux("kill-window", "-t", f"={SESSION}:5")
+        self.assertEqual(self.bb("restore", key).returncode, 0)
+        self.assertEqual(self.active_window(), "5")
+
+    def test_dismiss_agent_forgets_the_exited_claude(self):
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        pane = self.ledger()["windows"][key]["panes"][0]["pane_id"]
+        os.kill(kid, 15)
+        self.assertTrue(self.wait(lambda: self.tmux("display-message", "-p", "-t", pane,
+                                                    "#{pane_current_command}").strip() == "bash"))
+        res = self.bb("dismiss", "--agent", key, pane)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIsNone(self.ledger()["windows"][key]["panes"][0]["claude"])
+        self.bb("tick")
+        self.assertIsNone(self.ledger()["windows"][key]["panes"][0]["claude"])
+        self.assertIn(key, self.ledger()["windows"])            # the window itself is kept
+
     def test_live_session_is_refused(self):
         self.start_agent_window()
         self.bb("tick")
