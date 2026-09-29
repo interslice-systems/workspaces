@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs the ws-blackbox Python suites (unit + tmux integration on a private TMUX_TMPDIR).
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$here/.." && python3 -m unittest discover -s test -p 'test_wsbb_*.py' "$@"

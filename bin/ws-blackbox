@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""ws-blackbox — record tmux windows and their Claude sessions; restore what disappeared."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+from wsbb.cli import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))
