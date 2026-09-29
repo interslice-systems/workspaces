@@ -697,7 +697,9 @@ BarWidget {
         leftCap: false
         glyph: ""
         glyphFamily: "omarchy"
-        label: root.hostname
+        // U+F071 (warning) appears only when an installed ws-blackbox recorder has gone stale;
+        // the shape is the signal, not a colour (CVD).
+        label: root.hostname + (root.recorder.installed && root.recorder.stale ? " \uf071" : "")
         color: root.fillFor(root.hostname)
         textColor: root.fillTextFor(root.hostname)
       }
@@ -711,15 +713,23 @@ BarWidget {
 
     Item { width: Style.spaceReal(5); height: 1 }
 
+    // Live workspaces interleaved with ws-blackbox ghosts: a workspace that vanished but
+    // still has recorded windows keeps an outlined pill in its old slot.
     Repeater {
-      model: root.workspaceList()
+      model: WorkspaceMenuModel.barEntries(root.workspaceList(), root.ghostList)
 
       Item {
         id: entry
         required property var modelData
         required property int index
-        readonly property bool focused: modelData.focused
-        readonly property bool urgent: modelData.urgent
+        readonly property bool ghost: modelData.ghost === true
+        readonly property var ws: ghost ? null : modelData.ws
+        readonly property bool focused: !ghost && ws.focused
+        readonly property bool urgent: !ghost && ws.urgent
+        readonly property string key: ghost ? modelData.name : root.wsKey(ws)
+        readonly property string flatLabel: ghost
+          ? WorkspaceMenuModel.wsBarLabel(modelData.id, modelData.name, false)
+          : root.wsLabel(ws, urgent)
 
         width: focused ? pill.implicitWidth : flat.implicitWidth
         height: root.barSize
@@ -728,9 +738,9 @@ BarWidget {
           id: pill
           anchors.verticalCenter: parent.verticalCenter
           visible: entry.focused
-          label: root.wsLabel(entry.modelData, false)
-          color: root.fillFor(root.wsKey(entry.modelData))
-          textColor: root.fillTextFor(root.wsKey(entry.modelData))
+          label: entry.ghost ? "" : root.wsLabel(entry.ws, false)
+          color: root.fillFor(entry.key)
+          textColor: root.fillTextFor(entry.key)
         }
 
         Item {
@@ -739,11 +749,25 @@ BarWidget {
           visible: !entry.focused
           implicitWidth: flatText.implicitWidth + root.roundPad * 2
           implicitHeight: root.pillH
+
+          // A ghost is an OUTLINE with no fill and dimmed text -- shape and opacity carry
+          // the state, never hue alone.
+          Rectangle {
+            visible: entry.ghost
+            anchors.fill: parent
+            radius: height / 2
+            color: "transparent"
+            border.width: 1
+            border.color: root.flatFgFor(entry.key)
+            opacity: 0.6
+          }
+
           Text {
             id: flatText
             anchors.centerIn: parent
-            text: root.wsLabel(entry.modelData, entry.urgent)
-            color: root.flatFgFor(root.wsKey(entry.modelData))
+            text: entry.flatLabel
+            color: root.flatFgFor(entry.key)
+            opacity: entry.ghost ? 0.45 : 1.0
             font.family: root.nerdFamily
             font.pixelSize: root.labelPx
             font.bold: true
@@ -756,8 +780,10 @@ BarWidget {
           acceptedButtons: Qt.LeftButton | Qt.RightButton
           cursorShape: Qt.PointingHandCursor
           onClicked: function(mouse) {
-            if (mouse.button === Qt.RightButton) root.toggleWsMenu(entry, entry.modelData)
-            else root.focusWorkspace(entry.modelData.id)
+            if (mouse.button === Qt.RightButton)
+              root.toggleWsMenu(entry, entry.ws,
+                entry.ghost ? {name: entry.modelData.name, id: entry.modelData.id} : null)
+            else if (!entry.ghost) root.focusWorkspace(entry.ws.id)
           }
         }
       }

@@ -431,7 +431,7 @@ PopupCard {
                 }
                 Text {
                   anchors.centerIn: parent
-                  text: btn.modelData === "restore" ? "↺" : "✕"
+                  text: btn.modelData === "restore" ? "\u21ba" : "\u2715"
                   color: Color.foreground
                   font.pixelSize: Style.font.body
                   renderType: Text.NativeRendering

@@ -395,6 +395,10 @@ assert_contains "ghosts suppressed when the live fetch is invalid" 'ws.tmuxLiveV
 assert_contains "gone rows say so in words" '" gone"' "$menu"
 assert_contains "agent-gone rows say so in words" '" agent gone"' "$menu"
 
+assert_contains "bar interleaves ghost pills" 'WorkspaceMenuModel.barEntries(root.workspaceList(), root.ghostList)' "$workspaces"
+assert_contains "ghost pills are outlined, not filled" 'border.width: 1' "$workspaces"
+assert_contains "stale glyph only when the recorder is installed" 'root.recorder.installed && root.recorder.stale' "$workspaces"
+
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"
   exit 1
