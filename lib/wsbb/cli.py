@@ -1,6 +1,11 @@
 """ws-blackbox: record tmux windows and their Claude sessions; restore what disappeared."""
 import argparse
 import sys
+import time
+
+from . import ledger as ledger_mod
+from . import observe, paths, state
+from .procs import ProcTable
 
 
 def _not_yet(args):
@@ -33,3 +38,50 @@ HANDLERS = {}
 def main(argv):
     args = build_parser().parse_args(argv)
     return HANDLERS.get(args.command, _not_yet)(args)
+
+
+def cmd_tick(args):
+    d = state.ensure_state_dir()
+    now = int(time.time())
+    partial = []
+    try:
+        with state.locked(d):
+            led, problem = state.load_ledger(d, now, repair=True)
+            if problem:
+                partial.append(problem)
+            rows, error = observe.observe_now()
+            if error:
+                partial.append("tmux")
+            elif rows:
+                try:
+                    clients = observe.read_clients(paths.clients_cmd())
+                except observe.SourceError:
+                    clients = None
+                    partial.append("clients")
+                try:
+                    procs = ProcTable(paths.proc_root())
+                except OSError:
+                    procs = None
+                    partial.append("proc")
+                sessions = paths.claude_dir() / "sessions"
+                obs = {"boot8": observe.boot8(paths.boot_id_file()), "clients": clients,
+                       "windows": observe.group_windows(rows, procs, sessions)}
+                if ledger_mod.upsert(led, obs, now) or problem:
+                    state.atomic_write_json(d / state.LEDGER, led)
+            elif problem:
+                state.atomic_write_json(d / state.LEDGER, led)
+            try:
+                prev = state.read_json(d / state.HEARTBEAT, {})
+            except ValueError:
+                prev = {}
+            state.atomic_write_json(d / state.HEARTBEAT, {
+                "last_attempt": now,
+                "last_full": now if not partial else prev.get("last_full"),
+                "partial_sources": partial,
+            })
+    except state.LockTimeout:
+        return 0   # a restore holds the lock; the next minute records
+    return 0
+
+
+HANDLERS["tick"] = cmd_tick
