@@ -412,8 +412,11 @@ assert_contains "rows under a ghost workspace offer only dismiss (Restore worksp
   'model: rowRect.isGone ? (card.targetGhost ? ["dismiss"] : ["restore", "dismiss"])' "$menu"
 
 assert_contains "a pill knows its menu is open" 'readonly property bool menuOpen: wsMenu.open' "$workspaces"
-assert_contains "the open pill carries a caret glyph (escape text, not a literal)" '(entry.menuOpen ? " \u25be" : "")' "$workspaces"
+assert_contains "the open pill trades its middot for a caret (no width change)" 'WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false), entry.menuOpen)' "$workspaces"
 assert_contains "the open pill is underlined" 'visible: entry.menuOpen' "$workspaces"
+
+assert_contains "captions are copied from modelData, never type-checked" 'WorkspaceMenuModel.stringList(modelData.row.caption)' "$menu"
+assert_not_contains "no Array.isArray on modelData (array-like after the Repeater)" 'Array.isArray(modelData' "$menu"
 
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"

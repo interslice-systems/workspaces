@@ -743,15 +743,14 @@ BarWidget {
         readonly property bool focused: !ghost && ws.focused
         readonly property bool urgent: !ghost && ws.urgent
         readonly property string key: ghost ? modelData.name : root.wsKey(ws)
-        // The pill whose window menu is open gets a caret and an underline, so the card below
-        // always reads as belonging to it -- shape, not hue.
+        // The pill whose window menu is open trades its middot for a caret (same cell width,
+        // nothing shifts) and gets an underline, so the card reads as its own -- shape, not hue.
         readonly property bool menuOpen: wsMenu.open && (ghost
           ? (wsMenu.targetGhost !== null && wsMenu.targetGhost.name === modelData.name)
           : wsMenu.targetWs === ws)
-        readonly property string caret: (entry.menuOpen ? " \u25be" : "")
-        readonly property string flatLabel: (ghost
+        readonly property string flatLabel: WorkspaceMenuModel.openLabel(ghost
           ? WorkspaceMenuModel.wsBarLabel(modelData.id, modelData.name, false)
-          : root.wsLabel(ws, urgent)) + caret
+          : root.wsLabel(ws, urgent), menuOpen)
 
         width: focused ? pill.implicitWidth : flat.implicitWidth
         height: root.barSize
@@ -760,7 +759,7 @@ BarWidget {
           id: pill
           anchors.verticalCenter: parent.verticalCenter
           visible: entry.focused
-          label: entry.ghost ? "" : root.wsLabel(entry.ws, false) + entry.caret
+          label: entry.ghost ? "" : WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false), entry.menuOpen)
           color: root.fillFor(entry.key)
           textColor: root.fillTextFor(entry.key)
         }

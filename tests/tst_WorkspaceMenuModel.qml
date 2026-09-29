@@ -569,4 +569,20 @@ TestCase {
     compare(Model.captionLines({panes: [{children: []}]}), [])
     compare(Model.captionLines(null), [])
   }
+
+  // A JS array handed through a Repeater's modelData arrives array-LIKE (Array.isArray is
+  // false, length and indexing work). The delegate must copy, never type-check.
+  function test_string_list_copies_array_likes() {
+    compare(Model.stringList({length: 2, 0: "a", 1: "b"}), ["a", "b"])
+    compare(Model.stringList(["x"]), ["x"])
+    compare(Model.stringList(null), [])
+    compare(Model.stringList("oops"), [])
+  }
+
+  function test_open_label_swaps_the_middot_for_a_caret() {
+    compare(Model.openLabel("2\u00b7mirepoix-native", true), "2\u25bemirepoix-native")
+    compare(Model.openLabel("2\u00b7mirepoix-native", false), "2\u00b7mirepoix-native")
+    compare(Model.openLabel("1\u00b7\uf0f3 mirepoix", true), "1\u25be\uf0f3 mirepoix")
+    compare(Model.openLabel("7", true), "7")
+  }
 }

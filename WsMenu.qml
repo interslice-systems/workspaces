@@ -200,9 +200,13 @@ PopupCard {
           readonly property string rowState: isTmux && modelData.row ? modelData.row.state : ""
           readonly property bool isGone: rowState === "gone"
           readonly property bool isAgentGone: rowState === "agent-gone"
-          readonly property var caption: isTmux && modelData.row && Array.isArray(modelData.row.caption)
-            ? modelData.row.caption : []
-          readonly property string longestCaption: caption.reduce(function(a, b) { return b.length > a.length ? b : a }, "")
+          readonly property var caption: isTmux && modelData.row
+            ? WorkspaceMenuModel.stringList(modelData.row.caption) : []
+          readonly property string longestCaption: {
+            var best = ""
+            for (var i = 0; i < caption.length; i++) if (caption[i].length > best.length) best = caption[i]
+            return best
+          }
           readonly property bool isGhostActions: modelData.kind === "ghost-actions"
           readonly property bool isDismissAll: modelData.kind === "dismiss-all"
           readonly property bool isRecorder: modelData.kind === "recorder"

@@ -484,3 +484,19 @@ function recorderStatus(heartbeat, nowSec) {
   return {installed: true, stale: stale,
           text: stale ? "recorder stopped · " + shortAge(age) : "recorded " + shortAge(age) + " ago"}
 }
+
+// Arrays handed through a Repeater's modelData arrive array-LIKE: Array.isArray is false while
+// length and indexing work. Copy into a real array of strings instead of type-checking.
+function stringList(value) {
+  var out = []
+  if (!value || typeof value === "string" || typeof value.length !== "number") return out
+  for (var i = 0; i < value.length; i++) out.push(String(value[i]))
+  return out
+}
+
+// The pill whose menu is open trades its middot for a caret -- same cell width in the
+// monospace bar font, so nothing shifts. A bare id (no middot) is left as is.
+function openLabel(label, open) {
+  var s = String(label || "")
+  return open ? s.replace("\u00b7", "\u25be") : s
+}
