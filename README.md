@@ -79,6 +79,31 @@ URL routing is opt-in: install a desktop entry whose `Exec` is
 and point `~/.config/mimeapps.list` at it. Nothing runs `ws-open` unless a
 machine's mimeapps says so.
 
+## ws-blackbox (optional): remember what disappeared
+
+`bin/ws-blackbox` records every tmux window, its panes, and the Claude Code session in each
+pane once a minute (a systemd user timer; nothing stays resident). When a window or a whole
+workspace disappears -- closed, crashed, OOM-killed, rebooted -- the bar keeps it: a greyed
+`gone` row in the workspace menu, or an outlined pill for a vanished workspace. ↺ rebuilds it
+and **types** `claude --resume <id>` at the prompt without pressing Enter; ✕ forgets it.
+
+```sh
+ln -sfn "$R"/bin/ws-blackbox ~/.local/bin/
+for u in "$R"/systemd/*; do ln -sfn "$u" ~/.config/systemd/user/; done
+systemctl --user daemon-reload && systemctl --user enable --now ws-blackbox.timer
+ws-blackbox status   # is it recording
+ws-blackbox what     # what is gone, why (journald), and the resume lines
+```
+
+State lives in `~/.local/state/ws-blackbox/` (0700). It stores window names, working
+directories, Claude session ids and short command names -- never full command lines. Nothing
+is pruned automatically: an entry leaves only when you dismiss or restore it. Without the
+timer installed the widget looks exactly as it did.
+
+Workspace restore asks Hyprland to launch the terminal, so the terminal (and any tmux server
+it starts) is Hyprland's child whoever ran the restore. `ws-blackbox` itself only ever talks
+to tmux with `-N`, never renames or switches sessions, and never sends Enter.
+
 ## The commands
 
 | Command | What it does |
@@ -116,11 +141,14 @@ and clears when you focus the workspace.
 
 ```sh
 for t in test/test-*; do bash "$t"; done
+/usr/lib/qt6/bin/qmltestrunner -input tests/tst_WorkspaceMenuModel.qml
 ```
 
 Every suite is hermetic — hyprctl, tmux, the prompt and the notifier are all
 stubbed — except that the two colour suites read the installed palette and
-skip when it is absent. `tests/tst_WorkspaceMenuModel.qml` is a Qt Quick Test
+skip when it is absent. `test/test-ws-blackbox` runs a real tmux, but on a private
+server (`TMUX_TMPDIR` points at a temp dir, and the suite checks the socket path
+before touching anything). `tests/tst_WorkspaceMenuModel.qml` is a Qt Quick Test
 for the window-menu model.
 
 ## Known behaviour
