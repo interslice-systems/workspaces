@@ -147,7 +147,17 @@ BarWidget {
   }
 
   readonly property var recorder: WorkspaceMenuModel.recorderStatus(root.heartbeat, root.nowSec)
-  readonly property var ghostList: WorkspaceMenuModel.ghostWorkspaces(root.ledger, root.liveWorkspaceNames())
+  // Memoized: the ledger is rewritten whenever a Claude flips busy/idle, and a fresh array
+  // here would rebuild every bar pill each time. Reassign only when the ghosts really change
+  // (a ledger write, or a workspace appearing / disappearing / being renamed).
+  property var ghostList: []
+  readonly property string liveNamesKey: JSON.stringify(Object.keys(root.liveWorkspaceNames()).sort())
+  function refreshGhosts() {
+    var next = WorkspaceMenuModel.ghostWorkspaces(root.ledger, root.liveWorkspaceNames())
+    if (JSON.stringify(next) !== JSON.stringify(root.ghostList)) root.ghostList = next
+  }
+  onLedgerChanged: root.refreshGhosts()
+  onLiveNamesKeyChanged: root.refreshGhosts()
 
   function liveWorkspaceNames() {
     var out = Object.create(null)

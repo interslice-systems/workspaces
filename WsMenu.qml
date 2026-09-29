@@ -89,7 +89,7 @@ PopupCard {
       var tmuxRows = (workspaceName && ws.tmuxWindows[workspaceName])
         ? ws.tmuxWindows[workspaceName] : []
       var merged = WorkspaceMenuModel.mergeWindows(tmuxRows, ws.tmuxLiveKeys,
-        ws.tmuxLiveValid ? ws.ledger : null, workspaceName, ws.bootId8)
+        (ws.tmuxLiveValid && ws.bootId8) ? ws.ledger : null, workspaceName, ws.bootId8)
       if (card.targetGhost) out.push({kind: "ghost-actions", name: workspaceName})
       for (var i = 0; i < merged.length; i++)
         out.push({kind: "tmux", win: merged[i].win, row: merged[i]})
