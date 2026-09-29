@@ -260,3 +260,194 @@ function correlateFirefox(nativeWindows, tabs) {
     return empty
   }
 }
+
+// --- ws-blackbox overlay ------------------------------------------------------------
+// The recorder (bin/ws-blackbox, a 1-minute user timer) keeps ledger.json: every tmux
+// window it has seen and nobody dismissed. The menu overlays it on the LIVE tmux fetch:
+// a ledger key missing from the server-wide live key set is a ghost. Keys must match
+// the Python side's window_key() byte for byte.
+var MAX_LEDGER_CHARS = 8 * 1024 * 1024
+var LEDGER_SHELLS = {bash: true, sh: true, zsh: true, fish: true, dash: true}
+var STALE_AFTER_SECONDS = 300
+
+function blackboxKey(boot8, serverPid, serverStart, windowId) {
+  return String(boot8) + ":" + String(serverPid) + ":" + String(serverStart) + ":" + String(windowId)
+}
+
+function parseLedger(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_LEDGER_CHARS) return null
+  var doc
+  try { doc = JSON.parse(raw) } catch (error) { return null }
+  if (!isPlainObject(doc) || doc.version !== 1) return null
+  if (!isPlainObject(doc.windows) || !isPlainObject(doc.workspaces)) return null
+  var windows = Object.create(null)
+  var keys = Object.keys(doc.windows)
+  for (var i = 0; i < keys.length; i++) {
+    var e = doc.windows[keys[i]]
+    if (!isPlainObject(e) || !isInteger(e.index) || typeof e.name !== "string"
+        || typeof e.session !== "string" || !Array.isArray(e.panes)) continue
+    windows[keys[i]] = e
+  }
+  return {windows: windows, workspaces: doc.workspaces}
+}
+
+function parseHeartbeat(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 65536) return null
+  try {
+    var doc = JSON.parse(raw)
+    return isPlainObject(doc) ? doc : null
+  } catch (error) { return null }
+}
+
+function parsePaneCommands(text) {
+  var out = Object.create(null)
+  var parts = String(text || "").split(";")
+  for (var i = 0; i < parts.length; i++) {
+    var eq = parts[i].indexOf("=")
+    if (eq > 0) out[parts[i].slice(0, eq)] = parts[i].slice(eq + 1)
+  }
+  return out
+}
+
+function isNoServer(err) {
+  var s = String(err || "")
+  return s.indexOf("no server running on") !== -1
+    || (s.indexOf("error connecting to") !== -1 && s.indexOf("No such file or directory") !== -1)
+}
+
+function parseTmuxWindows(exitCode, out, err) {
+  var map = {}
+  if (exitCode !== 0) return {bySession: map, valid: isNoServer(err)}
+  var lines = String(out || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i] === "") continue
+    var p = lines[i].split("\u001f")
+    if (p.length < 9) continue
+    var w = {session: p[0], idx: parseInt(p[1], 10), name: p[2], bell: p[3] === "1",
+             windowId: p[4], serverPid: p[5], serverStart: p[6],
+             paneCommands: parsePaneCommands(p[7]),
+             state: tmuxWindowState(p.slice(8).join("\u001f"))}
+    if (!map[w.session]) map[w.session] = []
+    map[w.session].push(w)
+  }
+  return {bySession: map, valid: true}
+}
+
+function liveKeySet(boot8, bySession) {
+  var out = Object.create(null)
+  if (!boot8 || !bySession) return out
+  var sessions = Object.keys(bySession)
+  for (var s = 0; s < sessions.length; s++) {
+    var rows = bySession[sessions[s]] || []
+    for (var i = 0; i < rows.length; i++)
+      if (rows[i] && rows[i].windowId)
+        out[blackboxKey(boot8, rows[i].serverPid, rows[i].serverStart, rows[i].windowId)] = true
+  }
+  return out
+}
+
+function childrenCaption(entry) {
+  if (!entry || !Array.isArray(entry.panes)) return ""
+  var seen = Object.create(null)
+  var words = []
+  for (var i = 0; i < entry.panes.length; i++) {
+    var kids = entry.panes[i] && Array.isArray(entry.panes[i].children) ? entry.panes[i].children : []
+    for (var j = 0; j < kids.length; j++) {
+      var c = kids[j] && typeof kids[j].cmd === "string" ? kids[j].cmd : ""
+      if (c && !seen[c]) { seen[c] = true; words.push(c) }
+    }
+  }
+  return words.join(" · ")
+}
+
+function mergeWindows(liveRows, liveKeys, ledger, workspaceName, boot8) {
+  var rows = []
+  var windows = ledger && ledger.windows ? ledger.windows : Object.create(null)
+  var live = Array.isArray(liveRows) ? liveRows : []
+  for (var i = 0; i < live.length; i++) {
+    var w = live[i]
+    var key = (boot8 && w.windowId) ? blackboxKey(boot8, w.serverPid, w.serverStart, w.windowId) : ""
+    var entry = key && windows[key] ? windows[key] : null
+    var row = {state: "live", win: w, key: key, paneId: "", caption: childrenCaption(entry)}
+    if (entry && w.paneCommands) {
+      for (var j = 0; j < entry.panes.length; j++) {
+        var p = entry.panes[j]
+        if (p && p.claude && p.claude.session_id && LEDGER_SHELLS[w.paneCommands[p.pane_id]] === true) {
+          row.state = "agent-gone"
+          row.paneId = String(p.pane_id)
+          break
+        }
+      }
+    }
+    rows.push(row)
+  }
+  if (ledger) {
+    var keys = Object.keys(windows).sort()
+    for (var k = 0; k < keys.length; k++) {
+      var e = windows[keys[k]]
+      if (liveKeys[keys[k]] === true || e.restored_to) continue
+      if (!e.workspace || e.workspace.name !== workspaceName) continue
+      rows.push({state: "gone", key: keys[k], paneId: "", caption: childrenCaption(e),
+                 win: {session: e.session, idx: e.index, name: e.name, bell: false, state: ""}})
+    }
+  }
+  rows.sort(function(a, b) {
+    if (a.win.idx !== b.win.idx) return a.win.idx - b.win.idx
+    var ag = a.state === "gone" ? 1 : 0
+    var bg = b.state === "gone" ? 1 : 0
+    if (ag !== bg) return ag - bg
+    return a.key < b.key ? -1 : (a.key > b.key ? 1 : 0)
+  })
+  return rows
+}
+
+function ghostWorkspaces(ledger, liveNames) {
+  if (!ledger) return []
+  var counts = Object.create(null)
+  var keys = Object.keys(ledger.windows)
+  for (var i = 0; i < keys.length; i++) {
+    var e = ledger.windows[keys[i]]
+    if (e.restored_to || !e.workspace || typeof e.workspace.name !== "string") continue
+    counts[e.workspace.name] = (counts[e.workspace.name] || 0) + 1
+  }
+  var out = []
+  var names = Object.keys(ledger.workspaces)
+  for (var n = 0; n < names.length; n++) {
+    var meta = ledger.workspaces[names[n]]
+    if (!counts[names[n]] || (liveNames && liveNames[names[n]] === true)) continue
+    if (!isPlainObject(meta) || !isInteger(meta.id)) continue
+    out.push({name: names[n], id: meta.id})
+  }
+  out.sort(function(a, b) { return a.id - b.id || (a.name < b.name ? -1 : (a.name > b.name ? 1 : 0)) })
+  return out
+}
+
+function barEntries(liveList, ghosts) {
+  var out = []
+  var live = liveList || []
+  var gs = ghosts || []
+  var g = 0
+  for (var i = 0; i < live.length; i++) {
+    while (g < gs.length && gs[g].id < live[i].id) { out.push({ghost: true, ws: null, name: gs[g].name, id: gs[g].id}); g++ }
+    out.push({ghost: false, ws: live[i], name: "", id: live[i].id})
+    while (g < gs.length && gs[g].id === live[i].id) { out.push({ghost: true, ws: null, name: gs[g].name, id: gs[g].id}); g++ }
+  }
+  for (; g < gs.length; g++) out.push({ghost: true, ws: null, name: gs[g].name, id: gs[g].id})
+  return out
+}
+
+function shortAge(seconds) {
+  var s = Math.max(0, Math.floor(seconds))
+  return s < 60 ? s + "s" : (s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h")
+}
+
+// installed=false (no heartbeat file) keeps the bar unchanged on machines without the recorder.
+function recorderStatus(heartbeat, nowSec) {
+  if (!isPlainObject(heartbeat)) return {installed: false, stale: false, text: ""}
+  if (!isInteger(heartbeat.last_full) || !isFinite(nowSec))
+    return {installed: true, stale: true, text: "recorder not recording"}
+  var age = nowSec - heartbeat.last_full
+  var stale = age > STALE_AFTER_SECONDS
+  return {installed: true, stale: stale,
+          text: stale ? "recorder stopped · " + shortAge(age) : "recorded " + shortAge(age) + " ago"}
+}

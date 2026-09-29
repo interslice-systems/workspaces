@@ -447,4 +447,90 @@ TestCase {
     compare(matches["__proto__"].windowId, 101)
     compare(matches["constructor"].windowId, 202)
   }
+
+  // --- ws-blackbox overlay --------------------------------------------------
+  function ledgerFixture() {
+    return JSON.stringify({version: 1, workspaces: {"mirepoix": {id: 1, last_seen: 5}, "old": {id: 3, last_seen: 5}},
+      windows: {
+        "b00b1e55:7:70:@1": {session: "mirepoix", index: 1, name: "a", workspace: {id: 1, name: "mirepoix"},
+          restored_to: null, panes: [{pane_id: "%1", claude: {session_id: "u1"}, children: [{cmd: "claude"}, {cmd: "ruby bin/dev"}]}]},
+        "b00b1e55:7:70:@2": {session: "mirepoix", index: 2, name: "b", workspace: {id: 1, name: "mirepoix"},
+          restored_to: null, panes: [{pane_id: "%2", claude: null, children: []}]},
+        "b00b1e55:6:60:@9": {session: "old", index: 1, name: "c", workspace: {id: 3, name: "old"},
+          restored_to: null, panes: []},
+        "bad": {index: "x"}
+      }})
+  }
+
+  function test_parse_ledger_drops_bad_entries_and_rejects_junk() {
+    var l = Model.parseLedger(ledgerFixture())
+    verify(l !== null)
+    compare(Object.keys(l.windows).length, 3)
+    compare(Model.parseLedger("{"), null)
+    compare(Model.parseLedger(JSON.stringify({version: 2, windows: {}, workspaces: {}})), null)
+    compare(Model.parseLedger(""), null)
+  }
+
+  function test_parse_tmux_windows_exit_handling() {
+    var line = ["mirepoix", "1", "a", "0", "@1", "7", "70", "%1=bash;%3=claude;", "|idle"].join("\u001f")
+    var ok = Model.parseTmuxWindows(0, line + "\n", "")
+    verify(ok.valid)
+    compare(ok.bySession["mirepoix"][0].paneCommands["%1"], "bash")
+    compare(ok.bySession["mirepoix"][0].windowId, "@1")
+    var none = Model.parseTmuxWindows(1, "", "no server running on /tmp/tmux-1000/default\n")
+    verify(none.valid)
+    compare(Object.keys(none.bySession).length, 0)
+    var broken = Model.parseTmuxWindows(1, "", "some other failure")
+    verify(!broken.valid)
+  }
+
+  function test_merge_marks_live_agent_gone_and_gone_in_index_order() {
+    var l = Model.parseLedger(ledgerFixture())
+    var live = [{session: "mirepoix", idx: 1, name: "a", bell: false, state: "", windowId: "@1",
+                 serverPid: "7", serverStart: "70", paneCommands: {"%1": "bash"}}]
+    var keys = Model.liveKeySet("b00b1e55", {"mirepoix": live})
+    var rows = Model.mergeWindows(live, keys, l, "mirepoix", "b00b1e55")
+    compare(rows.length, 2)
+    compare(rows[0].state, "agent-gone")
+    compare(rows[0].paneId, "%1")
+    compare(rows[0].caption, "claude · ruby bin/dev")
+    compare(rows[1].state, "gone")
+    compare(rows[1].win.name, "b")
+  }
+
+  function test_merge_with_null_ledger_shows_no_ghosts() {
+    var live = [{session: "mirepoix", idx: 1, name: "a", windowId: "@1", serverPid: "7", serverStart: "70", paneCommands: {}}]
+    var rows = Model.mergeWindows(live, {}, null, "mirepoix", "b00b1e55")
+    compare(rows.length, 1)
+    compare(rows[0].state, "live")
+  }
+
+  function test_server_restart_old_keys_become_ghosts_new_are_live() {
+    var l = Model.parseLedger(ledgerFixture())
+    var live = [{session: "mirepoix", idx: 1, name: "a", windowId: "@1", serverPid: "8", serverStart: "80",
+                 paneCommands: {"%1": "bash"}}]
+    var rows = Model.mergeWindows(live, Model.liveKeySet("b00b1e55", {"mirepoix": live}), l, "mirepoix", "b00b1e55")
+    compare(rows.map(function(r) { return r.state }), ["live", "gone", "gone"])
+  }
+
+  function test_ghost_workspaces_and_bar_interleave() {
+    var l = Model.parseLedger(ledgerFixture())
+    var ghosts = Model.ghostWorkspaces(l, {"mirepoix": true})
+    compare(ghosts.length, 1)
+    compare(ghosts[0].name, "old")
+    var bar = Model.barEntries([{id: 1}, {id: 3}, {id: 5}], ghosts)
+    compare(bar.map(function(e) { return (e.ghost ? "g" : "w") + e.id }), ["w1", "w3", "g3", "w5"])
+    compare(Model.ghostWorkspaces(null, {}).length, 0)
+  }
+
+  function test_recorder_status() {
+    compare(Model.recorderStatus(null, 1000).installed, false)
+    var fresh = Model.recorderStatus({last_full: 960}, 1000)
+    verify(fresh.installed && !fresh.stale)
+    compare(fresh.text, "recorded 40s ago")
+    var stale = Model.recorderStatus({last_full: 280}, 1000)
+    verify(stale.stale)
+    compare(stale.text, "recorder stopped · 12m")
+    verify(Model.recorderStatus({last_full: null}, 1000).stale)
+  }
 }
