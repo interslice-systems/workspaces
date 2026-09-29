@@ -260,3 +260,23 @@ def cmd_restore(args):
 
 HANDLERS["dismiss"] = cmd_dismiss
 HANDLERS["restore"] = cmd_restore
+
+
+def cmd_spawn(args):
+    from . import restore
+    if not restore.RESTORE_ID.match(args.restore_id):
+        return 1
+    d = state.ensure_state_dir()
+    path = d / f"spawn-{args.restore_id}.json"
+    try:
+        record = state.read_json(path, None)
+    except ValueError:
+        record = None
+    path.unlink(missing_ok=True)
+    if not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]:
+        return 1
+    argv = restore.spawn_argv(record)
+    os.execvp(argv[0], argv)
+
+
+HANDLERS["_spawn"] = cmd_spawn
