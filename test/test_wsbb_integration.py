@@ -112,10 +112,33 @@ class RestoreIntegrationTest(unittest.TestCase):
             self.assertEqual(len(carried), 1)
             self.assertEqual(carried[0]["panes"][0]["claude"]["session_id"], UUID)
             self.assertEqual(self.bb("tick").returncode, 0)
+        # the row now offers the pane restore on the rebuilt window; pressing it adds nothing
+        new_key, e = next((k, e) for k, e in self.ledger()["windows"].items() if e["name"] == "agent")
+        again_pane = self.bb("restore", "--pane", new_key, e["panes"][0]["pane_id"])
+        self.assertEqual(again_pane.returncode, 0, again_pane.stderr)
+        time.sleep(0.3)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-J", "-t", f"={SESSION}:5").count("claude --resume"), 1)
 
         again = self.bb("restore", key)                                         # double click
         self.assertEqual(again.returncode, 1)
         self.assertIn("no such entry", again.stderr)
+
+    def test_rebuild_waits_for_the_line_editor_not_just_the_shell(self):
+        # A slow login shell: `bash` for a whole second before readline takes the terminal.
+        # Typing then would be echoed by the tty AND redisplayed at the prompt: two copies.
+        slow = "SECONDS=0; while ((SECONDS < 1)); do :; done\n"
+        for rc in (".bash_profile", ".bashrc"):
+            (self.base / "home" / rc).write_text(slow)
+        kid = self.start_agent_window()
+        self.bb("tick")
+        key = self.agent_key()
+        os.kill(kid, 15)
+        self.tmux("kill-window", "-t", f"={SESSION}:5")
+        self.tmux("set-option", "-g", "default-command", "")
+        self.assertEqual(self.bb("restore", key).returncode, 0)
+        self.assertTrue(self.wait(lambda: "claude --resume" in self.tmux("capture-pane", "-p", "-J", "-t", f"={SESSION}:5")))
+        time.sleep(0.5)
+        self.assertEqual(self.tmux("capture-pane", "-p", "-J", "-t", f"={SESSION}:5").count("claude --resume"), 1)
 
     def test_dry_run_creates_nothing(self):
         kid = self.start_agent_window()

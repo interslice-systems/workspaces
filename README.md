@@ -108,7 +108,8 @@ ws-blackbox what     # what is gone, why (journald), and the resume lines
 
 State lives in `~/.local/state/ws-blackbox/` (0700). It stores window names, working
 directories, Claude session ids and short command names -- never full command lines. Nothing
-is pruned automatically: an entry leaves only when you dismiss it or it is restored. Without the
+is pruned automatically: an entry leaves only when you dismiss it (a restored one moves to its
+rebuilt window). Without the
 timer installed the widget looks exactly as it did.
 
 Workspace restore asks Hyprland to launch the terminal, so the terminal (and any tmux server

@@ -68,6 +68,13 @@ class StateTest(unittest.TestCase):
         self.assertTrue(state.claim(d, "pane:k:%2", now=110))
         self.assertTrue(state.claim(d, "pane:k:%1", now=200))
 
+    def test_a_short_claim_does_not_expire_a_longer_one(self):
+        d = state.ensure_state_dir()
+        self.assertTrue(state.claim(d, "workspace:x", now=0))              # 30 s: a spawn in flight
+        self.assertTrue(state.claim(d, "pane:a", now=10, window=5))
+        self.assertFalse(state.claim(d, "workspace:x", now=12))            # still guarded
+        self.assertTrue(state.claim(d, "pane:a", now=16, window=5))
+
     def test_lock_times_out_when_held(self):
         d = state.ensure_state_dir()
         with state.locked(d):

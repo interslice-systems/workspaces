@@ -122,9 +122,10 @@ def claim(directory, action, now=None, window=CLAIM_WINDOW):
             recent = {}
         if not isinstance(recent, dict):
             recent = {}
-        recent = {k: v for k, v in recent.items() if isinstance(v, int) and now - v < window}
+        # each claim stores its own expiry, so a short claim never cuts a longer one short
+        recent = {k: v for k, v in recent.items() if isinstance(v, int) and v > now}
         if action in recent:
             return False
-        recent[action] = now
+        recent[action] = now + window
         atomic_write_json(d / RECENT, recent)
         return True

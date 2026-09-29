@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import termios
 import time
 
 from . import ledger as L
@@ -18,14 +19,31 @@ def current_server(tmux):
     return int(pid), int(start)
 
 
+def line_editor_waiting(tty):
+    """True once the shell's line editor owns the terminal (tty echo off). Before that -- a
+    shell still reading its rc files -- typed text is echoed by the tty and then shown again
+    at the prompt, so the pane would display the line twice."""
+    try:
+        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        return not termios.tcgetattr(fd)[3] & termios.ECHO
+    except termios.error:
+        return False
+    finally:
+        os.close(fd)
+
+
 def wait_for_shell(tmux, pane_id, timeout=SHELL_WAIT):
     deadline = time.monotonic() + timeout
     while True:
         try:
-            cmd = tmux("display-message", "-p", "-t", pane_id, "#{pane_current_command}").strip()
-        except TmuxError:
-            cmd = ""
-        if cmd in observe.SHELLS:
+            cmd, tty = tmux("display-message", "-p", "-t", pane_id,
+                            "#{pane_current_command} #{pane_tty}").split()
+        except (TmuxError, ValueError):
+            cmd, tty = "", ""
+        if cmd in observe.SHELLS and line_editor_waiting(tty):
             return True
         if time.monotonic() >= deadline:
             return False
