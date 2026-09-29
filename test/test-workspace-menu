@@ -269,16 +269,17 @@ assert_multiline "fallback and validated favicon visibility are complementary" \
   $'            Image {\n              anchors.fill: parent\n              source: card.firefoxFallbackIcon\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              smooth: true\n              visible: faviconImage.status !== Image.Ready\n            }\n\n            Image {\n              id: faviconImage\n              anchors.fill: parent\n              source: rowRect.isFirefox\n                ? WorkspaceMenuModel.safeFavicon(rowRect.modelData.tab.favicon) : ""\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              asynchronous: true\n              smooth: true\n              visible: status === Image.Ready\n            }' "$menu"
 assert_not_contains "fallback icon never uses a remote URL" \
   'https://icons' "$menu"
-assert_count "bare label, caption, tab title, and tab URL each elide" \
-  4 'elide: Text.ElideRight' "$menu"
+assert_count "bare label, caption, tab title, and tab URL each elide in the middle" \
+  4 'elide: Text.ElideMiddle' "$menu"
+assert_not_contains "no row elides only at the right" 'elide: Text.ElideRight' "$menu"
 assert_count "every browser- or ledger-derived text path is forced plain" \
   4 'textFormat: Text.PlainText' "$menu"
 assert_multiline "bare native label is forced plain before elision" \
   $'                  : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                    + rowRect.modelData.cls\n                    + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")))\n            textFormat: Text.PlainText\n            color:' "$menu"
 assert_multiline "Firefox title is forced plain and remains first" \
-  $'            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              font.family: Style.font.family\n              font.pixelSize: Style.font.body\n              font.bold: rowRect.isActiveFirefox\n              elide: Text.ElideRight\n              wrapMode: Text.NoWrap\n              renderType: Text.NativeRendering\n            }\n\n            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText' "$menu"
+  $'            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              font.family: Style.font.family\n              font.pixelSize: Style.font.body\n              font.bold: rowRect.isActiveFirefox\n              elide: Text.ElideMiddle\n              wrapMode: Text.NoWrap\n              renderType: Text.NativeRendering\n            }\n\n            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText' "$menu"
 assert_multiline "Firefox display URL is forced plain before elision" \
-  $'              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              opacity: 0.55\n              font.family: card.ws.nerdFamily\n              font.pixelSize: Style.font.caption\n              elide: Text.ElideRight' "$menu"
+  $'              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              opacity: 0.55\n              font.family: card.ws.nerdFamily\n              font.pixelSize: Style.font.caption\n              elide: Text.ElideMiddle' "$menu"
 assert_multiline "tmux rows precede native expansion" \
   $'      for (var i = 0; i < merged.length; i++)\n        out.push({kind: "tmux", win: merged[i].win, row: merged[i]})\n      if (!card.targetWs) return out\n\n      var bareRows = []' "$menu"
 assert_multiline "native matches expand in place in native order" \
@@ -292,7 +293,7 @@ assert_multiline "Flickable content height tracks the rendered column" \
 assert_multiline "Flickable owns the column and as-needed scrollbar" \
   $'    interactive: contentHeight > height\n    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }\n\n    Column {\n      id: col\n      width: menuFlick.width' "$menu"
 assert_multiline "popup cap remains tied to the rendered column" \
-  $'  triggerMode: "click"\n  contentWidth: fittedContentWidth(Math.max(Style.space(220), col.implicitWidth + padding * 2))\n  contentHeight: fittedContentHeight(col.implicitHeight, Style.space(560))' "$menu"
+  $'  triggerMode: "click"\n  contentWidth: fittedContentWidth(Math.max(Style.space(280), col.implicitWidth + padding * 2), Style.space(560))\n  contentHeight: fittedContentHeight(col.implicitHeight, Style.space(560))' "$menu"
 if [[ -f $firefox_icon && ! -L $firefox_icon && -s $firefox_icon ]]; then
   pass "packaged Firefox fallback is a regular nonempty file"
 else
@@ -404,6 +405,8 @@ assert_multiline "a failed tmux refresh keeps the previous live rows" \
 
 assert_contains "ghost pills are memoized, not rebuilt on every ledger write" 'if (JSON.stringify(next) !== JSON.stringify(root.ghostList)) root.ghostList = next' "$workspaces"
 assert_not_contains "ghost list is not a per-write binding" 'readonly property var ghostList:' "$workspaces"
+
+assert_contains "rows report their natural width so the card can size to content" 'implicitWidth: rowRect.naturalWidth' "$menu"
 
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"

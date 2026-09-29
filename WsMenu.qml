@@ -41,7 +41,7 @@ PopupCard {
   readonly property int targetId: targetWs ? targetWs.id : (targetGhost ? targetGhost.id : -1)
 
   triggerMode: "click"
-  contentWidth: fittedContentWidth(Math.max(Style.space(220), col.implicitWidth + padding * 2))
+  contentWidth: fittedContentWidth(Math.max(Style.space(280), col.implicitWidth + padding * 2), Style.space(560))
   contentHeight: fittedContentHeight(col.implicitHeight, Style.space(560))
 
   readonly property color cardGround: Color.popups.background
@@ -204,6 +204,28 @@ PopupCard {
           readonly property bool isGhostActions: modelData.kind === "ghost-actions"
           readonly property bool isDismissAll: modelData.kind === "dismiss-all"
           readonly property bool isRecorder: modelData.kind === "recorder"
+          // Each row reports its natural width so the card sizes to its widest row (between
+          // the 280 floor and the 560 cap); anything longer elides in the middle.
+          readonly property real naturalWidth: isDiv ? 0
+            : (isFirefox
+              ? Style.space(42) + Math.max(ffTitleMetrics.advanceWidth, ffUrlMetrics.advanceWidth)
+              : (isGhostActions ? ghostActionsRow.implicitWidth + Style.space(8)
+                : Style.space(16) + buttons.width
+                  + Math.max(rowText.implicitWidth, captionText.visible ? captionText.implicitWidth + Style.space(12) : 0)))
+          implicitWidth: rowRect.naturalWidth
+
+          TextMetrics {
+            id: ffTitleMetrics
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""
+          }
+          TextMetrics {
+            id: ffUrlMetrics
+            font.family: card.ws.nerdFamily
+            font.pixelSize: Style.font.caption
+            text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""
+          }
 
           width: col.width
           implicitHeight: isDiv ? Style.space(9)
@@ -250,7 +272,7 @@ PopupCard {
             opacity: rowRect.isGone ? 0.45 : (rowRect.isRecorder ? 0.5 : (rowRect.isTmux ? 1.0 : 0.85))
             font.family: card.ws.nerdFamily
             font.pixelSize: Style.font.body
-            elide: Text.ElideRight
+            elide: Text.ElideMiddle
             renderType: Text.NativeRendering
           }
 
@@ -268,7 +290,7 @@ PopupCard {
             opacity: rowRect.isGone ? 0.35 : 0.6
             font.family: card.ws.nerdFamily
             font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            elide: Text.ElideMiddle
             renderType: Text.NativeRendering
           }
 
@@ -322,7 +344,7 @@ PopupCard {
               font.family: Style.font.family
               font.pixelSize: Style.font.body
               font.bold: rowRect.isActiveFirefox
-              elide: Text.ElideRight
+              elide: Text.ElideMiddle
               wrapMode: Text.NoWrap
               renderType: Text.NativeRendering
             }
@@ -335,7 +357,7 @@ PopupCard {
               opacity: 0.55
               font.family: card.ws.nerdFamily
               font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
+              elide: Text.ElideMiddle
               wrapMode: Text.NoWrap
               renderType: Text.NativeRendering
             }
@@ -372,6 +394,7 @@ PopupCard {
           // Declared AFTER rowArea so these sit on top of it and get their own clicks.
           // Ghost-workspace header: two full-height text buttons.
           Row {
+            id: ghostActionsRow
             visible: rowRect.isGhostActions
             anchors.fill: parent
             anchors.leftMargin: Style.space(8)
