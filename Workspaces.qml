@@ -101,6 +101,72 @@ BarWidget {
     onLoadFailed: root.hostname = Quickshell.env("HOSTNAME") || "host"
   }
 
+  // --- ws-blackbox overlay ---------------------------------------------------
+  // bin/ws-blackbox (a 1-minute user timer) writes ledger.json + heartbeat.json atomically.
+  // FileView watches them via inotify -- no polling. Absent files = recorder not installed =
+  // this widget behaves exactly as before.
+  readonly property string blackboxDir: Quickshell.env("HOME") + "/.local/state/ws-blackbox"
+  property var ledger: null
+  property var heartbeat: null
+  property string bootId8: ""
+  property real nowSec: Date.now() / 1000
+
+  FileView {
+    path: root.blackboxDir + "/ledger.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.ledger = WorkspaceMenuModel.parseLedger(text())
+    onLoadFailed: root.ledger = null
+  }
+
+  FileView {
+    path: root.blackboxDir + "/heartbeat.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.heartbeat = WorkspaceMenuModel.parseHeartbeat(text())
+    onLoadFailed: root.heartbeat = null
+  }
+
+  Process {
+    running: true
+    command: ["cat", "/proc/sys/kernel/random/boot_id"]
+    stdout: StdioCollector {
+      onStreamFinished: root.bootId8 = String(text).trim().replace(/-/g, "").slice(0, 8)
+    }
+  }
+
+  // The overlay's one standing cost: a 60 s tick, so "recorder stopped" can appear when the
+  // heartbeat stops changing. Bindings only repaint when the stale state or text flips.
+  Timer {
+    interval: 60000
+    running: root.heartbeat !== null
+    repeat: true
+    onTriggered: root.nowSec = Date.now() / 1000
+  }
+
+  readonly property var recorder: WorkspaceMenuModel.recorderStatus(root.heartbeat, root.nowSec)
+  readonly property var ghostList: WorkspaceMenuModel.ghostWorkspaces(root.ledger, root.liveWorkspaceNames())
+
+  function liveWorkspaceNames() {
+    var out = {}
+    var list = root.workspaceList()
+    for (var i = 0; i < list.length; i++) {
+      var nm = root.wsName(list[i])
+      if (nm) out[nm] = true
+    }
+    return out
+  }
+
+  // argv runner (bash -lc 'exec "$@"'): names never pass through a shell parser. Runs as a
+  // child of this shell, i.e. inside wayland-wm@hyprland.desktop.service.
+  function blackbox(args) {
+    Util.execArgv([Quickshell.env("HOME") + "/.local/bin/ws-blackbox"].concat(args))
+    blackboxRefresh.restart()
+  }
+  Timer { id: blackboxRefresh; interval: 1500; onTriggered: root.refreshTmux() }
+
   function fnv1a32(s) { return WorkspaceMenuModel.fnv1a32(s) }
   function cellFor(name) {
     if (!root.cells.length) return null
@@ -176,29 +242,45 @@ BarWidget {
   property bool tmuxClientsReady: false
   property bool tmuxLoading: false
 
+  // The fetch also carries window ids, the server's pid/start_time (the ws-blackbox key) and
+  // each pane's current command. Exit status matters: "no server running" is a valid empty
+  // world (everything recorded is gone); any other failure must not make ghosts of everything.
+  property var tmuxLiveKeys: ({})
+  property bool tmuxLiveValid: false
+  property string tmuxWinOut: ""
+  property string tmuxWinErr: ""
+  property int tmuxWinExitCode: -1
+  property bool tmuxWinOutReady: false
+  property bool tmuxWinErrReady: false
+  property bool tmuxWinExitReady: false
+
   Process {
     id: tmuxWinProc
-    command: ["tmux", "list-windows", "-a", "-F",
-      "#{session_name}\u001f#{window_index}\u001f#{window_name}\u001f#{window_bell_flag}\u001f#{P:|#{@claude_state}}"]
+    command: ["tmux", "-N", "list-windows", "-a", "-F",
+      "#{session_name}\u001f#{window_index}\u001f#{window_name}\u001f#{window_bell_flag}\u001f#{window_id}\u001f#{pid}\u001f#{start_time}\u001f#{P:#{pane_id}=#{pane_current_command};}\u001f#{P:|#{@claude_state}}"]
     stdout: StdioCollector {
-      onStreamFinished: {
-        var map = {}
-        var lines = String(text).split("\n")
-        for (var i = 0; i < lines.length; i++) {
-          if (lines[i] === "") continue
-          var p = lines[i].split("\u001f")
-          if (p.length < 5) continue
-          var w = { session: p[0], idx: parseInt(p[1], 10), name: p[2],
-                    bell: p[3] === "1",
-                    state: WorkspaceMenuModel.tmuxWindowState(p.slice(4).join("\u001f")) }
-          if (!map[w.session]) map[w.session] = []
-          map[w.session].push(w)
-        }
-        root.tmuxWindows = map
-        root.tmuxWindowsReady = true
-        root.finishTmuxRefresh()
-      }
+      onStreamFinished: { root.tmuxWinOut = String(text); root.tmuxWinOutReady = true; root.finishTmuxWindows() }
     }
+    stderr: StdioCollector {
+      onStreamFinished: { root.tmuxWinErr = String(text); root.tmuxWinErrReady = true; root.finishTmuxWindows() }
+    }
+    // qmllint disable signal-handler-parameters
+    onExited: function(exitCode) {
+      root.tmuxWinExitCode = exitCode
+      root.tmuxWinExitReady = true
+      root.finishTmuxWindows()
+    }
+    // qmllint enable signal-handler-parameters
+  }
+
+  function finishTmuxWindows() {
+    if (!root.tmuxWinOutReady || !root.tmuxWinErrReady || !root.tmuxWinExitReady) return
+    var parsed = WorkspaceMenuModel.parseTmuxWindows(root.tmuxWinExitCode, root.tmuxWinOut, root.tmuxWinErr)
+    root.tmuxWindows = parsed.bySession
+    root.tmuxLiveValid = parsed.valid
+    root.tmuxLiveKeys = WorkspaceMenuModel.liveKeySet(root.bootId8, parsed.bySession)
+    root.tmuxWindowsReady = true
+    root.finishTmuxRefresh()
   }
 
   Process {
@@ -227,6 +309,10 @@ BarWidget {
     root.tmuxLoading = true
     root.tmuxWindowsReady = false
     root.tmuxClientsReady = false
+    root.tmuxWinOutReady = false
+    root.tmuxWinErrReady = false
+    root.tmuxWinExitReady = false
+    root.nowSec = Date.now() / 1000
   }
 
   function startTmuxRefresh() {
@@ -439,7 +525,8 @@ BarWidget {
     target: Hyprland
     enabled: wsMenu.open
     function onRawEvent(event) {
-      if (event.name === "bell" || event.name === "urgent") root.refreshTmux()
+      if (event.name === "bell" || event.name === "urgent"
+          || event.name === "closewindow" || event.name === "openwindow") root.refreshTmux()
     }
   }
 
@@ -449,27 +536,33 @@ BarWidget {
   // HyprlandFocusGrab. Right-clicking the same pill again toggles it closed;
   // a different pill retargets (close, re-anchor next tick, reopen -- a live
   // PopupWindow does not re-anchor on anchorItem reassignment alone).
-  function showWsMenu(item, w) {
-    wsMenu.targetWs = w
+  // `ghost` ({name, id}) targets a workspace that exists only in the ws-blackbox ledger;
+  // it has no toplevels, so the Firefox half is skipped entirely.
+  function showWsMenu(item, w, ghost) {
+    wsMenu.targetWs = w || null
+    wsMenu.targetGhost = ghost || null
     wsMenu.anchorItem = item
     root.prepareTmuxRefresh()
-    root.prepareFirefoxRefresh(w)
+    if (w) root.prepareFirefoxRefresh(w)
+    else root.clearFirefoxSnapshot()
     wsMenu.open = true
     root.startTmuxRefresh()
-    root.startFirefoxRefresh()
+    if (w) root.startFirefoxRefresh()
   }
 
-  function toggleWsMenu(item, w) {
-    if (wsMenu.open && wsMenu.targetId === w.id) {
+  function toggleWsMenu(item, w, ghost) {
+    var same = wsMenu.open && ((w && wsMenu.targetWs === w)
+      || (ghost && wsMenu.targetGhost && wsMenu.targetGhost.name === ghost.name))
+    if (same) {
       wsMenu.open = false
       return
     }
     root.renameOpen = false
     if (wsMenu.open) {
       wsMenu.open = false
-      Qt.callLater(function() { root.showWsMenu(item, w) })
+      Qt.callLater(function() { root.showWsMenu(item, w, ghost) })
     } else {
-      root.showWsMenu(item, w)
+      root.showWsMenu(item, w, ghost)
     }
   }
 

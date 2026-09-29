@@ -92,10 +92,12 @@ assert_count "tabs argv token is declared exactly once" 1 \
   '"tabs"' "$workspaces"
 # This is a conservative source contract, not a semantic QML proof: every
 # current sink is counted and pinned so an added override fails closed.
-assert_regex_count "workspace has exactly six semantic command sinks" 6 \
+assert_regex_count "workspace has exactly seven semantic command sinks" 7 \
   '(^|[^[:alnum:]_])(command[[:space:]]*:|[[:alnum:]_]+[[:space:]]*\.[[:space:]]*command[[:space:]]*=)' "$workspaces"
 assert_multiline "tmux window command is pinned to its Process" \
-  $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{P:|#{@claude_state}}"]' "$workspaces"
+  $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "-N", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{window_id}\\u001f#{pid}\\u001f#{start_time}\\u001f#{P:#{pane_id}=#{pane_current_command};}\\u001f#{P:|#{@claude_state}}"]' "$workspaces"
+assert_multiline "boot id command is pinned to its Process (ws-blackbox key)" \
+  $'  Process {\n    running: true\n    command: ["cat", "/proc/sys/kernel/random/boot_id"]' "$workspaces"
 assert_multiline "tmux client command is pinned to its Process" \
   $'  Process {\n    id: tmuxClientsProc\n    command: [Quickshell.env("HOME") + "/.local/bin/tmux-local-clients"]' "$workspaces"
 assert_multiline "snapshot command is pinned to its Process" \
@@ -170,7 +172,7 @@ assert_contains "queued restart rechecks popup applicability" \
 assert_contains "refresh cannot start while popup is closed" \
   'if (!wsMenu.open || !root.firefoxApplicable || firefoxTabsProc.running) return' "$workspaces"
 assert_multiline "popup initializes loading before open and launches after open" \
-  $'  function showWsMenu(item, w) {\n    wsMenu.targetWs = w\n    wsMenu.anchorItem = item\n    root.prepareTmuxRefresh()\n    root.prepareFirefoxRefresh(w)\n    wsMenu.open = true\n    root.startTmuxRefresh()\n    root.startFirefoxRefresh()\n  }' "$workspaces"
+  $'  function showWsMenu(item, w, ghost) {\n    wsMenu.targetWs = w || null\n    wsMenu.targetGhost = ghost || null\n    wsMenu.anchorItem = item\n    root.prepareTmuxRefresh()\n    if (w) root.prepareFirefoxRefresh(w)\n    else root.clearFirefoxSnapshot()\n    wsMenu.open = true\n    root.startTmuxRefresh()\n    if (w) root.startFirefoxRefresh()\n  }' "$workspaces"
 assert_multiline "terminating Firefox work remains pending until callbacks drain" \
   $'    if (firefoxTabsProc.running) {\n      root.firefoxRestartPending = root.firefoxApplicable\n      firefoxTabsProc.running = false\n      return\n    }\n    root.firefoxRestartPending = false' "$workspaces"
 assert_contains "loading combines tmux and Firefox" \
@@ -227,7 +229,7 @@ assert_not_matches "workspace activation never opens a URL" \
 assert_contains "activation wait disables every actionable row" \
   'enabled: !rowRect.isDiv && !card.ws.firefoxActivating' "$menu"
 assert_multiline "row clicks preserve tmux and bare focus around Firefox activation" \
-  $'            onClicked: {\n              if (rowRect.isTmux) {\n                card.ws.focusTmuxWindow(rowRect.modelData.win.session, rowRect.modelData.win.idx, card.targetId)\n                card.close()\n                return\n              }\n              if (rowRect.isFirefox) {\n                card.ws.activateFirefoxTab(rowRect.modelData.windowId, rowRect.modelData.tab.tabId,\n                                           rowRect.modelData.top, card.targetId)\n                return\n              }\n              card.ws.focusToplevel(rowRect.modelData.top, card.targetId)\n              card.close()\n            }' "$menu"
+  $'            onClicked: {\n              if (rowRect.isDismissAll) {\n                card.ws.blackbox(["dismiss", "--workspace", rowRect.modelData.name])\n                return\n              }\n              if (rowRect.isTmux) {\n                card.ws.focusTmuxWindow(rowRect.modelData.win.session, rowRect.modelData.win.idx, card.targetId)\n                card.close()\n                return\n              }\n              if (rowRect.isFirefox) {\n                card.ws.activateFirefoxTab(rowRect.modelData.windowId, rowRect.modelData.tab.tabId,\n                                           rowRect.modelData.top, card.targetId)\n                return\n              }\n              card.ws.focusToplevel(rowRect.modelData.top, card.targetId)\n              card.close()\n            }' "$menu"
 
 assert_contains "menu imports controls for its scrollbar" \
   'import QtQuick.Controls' "$menu"
@@ -238,13 +240,15 @@ assert_multiline "native collection failures preserve already-built tmux rows" \
 assert_multiline "malformed native descriptors disable all Firefox correlation" \
   $'        } catch (error) {\n          nativeEvidenceComplete = false\n        }\n      }\n\n      var correlations = nativeEvidenceComplete\n        ? WorkspaceMenuModel.correlateFirefox(nativeWindows, ws.firefoxTabs)\n        : Object.create(null)' "$menu"
 assert_multiline "Repeater row model contains unexpected property failures" \
-  $'  function rows() {\n    var out = []\n    try {' "$menu"
+  $'  function coreRows() {\n    var out = []\n    try {' "$menu"
+assert_multiline "footer wrapper contains unexpected property failures" \
+  $'  function rows() {\n    var out = card.coreRows()\n    try {' "$menu"
 assert_multiline "Repeater row model returns safely from its outer boundary" \
   $'      return out.concat(expanded)\n    } catch (error) {\n      return out\n    }\n  }' "$menu"
 assert_contains "matched toplevel becomes tab rows" \
   'kind: "firefox-tab"' "$menu"
 assert_multiline "Firefox delegate height is exactly 42px" \
-  $'          readonly property bool isFirefox: modelData.kind === "firefox-tab"\n          readonly property bool isActiveFirefox: isFirefox && modelData.tab.active === true\n\n          width: col.width\n          implicitHeight: isDiv ? Style.space(9)\n            : (isFirefox ? Style.space(42) : rowText.implicitHeight + Style.space(12))' "$menu"
+  $'          implicitHeight: isDiv ? Style.space(9)\n            : (isFirefox ? Style.space(42)\n              : rowText.implicitHeight + (captionText.visible ? captionText.implicitHeight : 0) + Style.space(12))' "$menu"
 assert_multiline "favicon slot is exactly 18px square" \
   $'          Item {\n            id: faviconSlot\n            visible: rowRect.isFirefox\n            anchors.left: parent.left\n            anchors.leftMargin: Style.space(8)\n            anchors.verticalCenter: parent.verticalCenter\n            width: Style.space(18)\n            height: Style.space(18)' "$menu"
 assert_contains "missing favicon uses the packaged local icon" \
@@ -265,18 +269,18 @@ assert_multiline "fallback and validated favicon visibility are complementary" \
   $'            Image {\n              anchors.fill: parent\n              source: card.firefoxFallbackIcon\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              smooth: true\n              visible: faviconImage.status !== Image.Ready\n            }\n\n            Image {\n              id: faviconImage\n              anchors.fill: parent\n              source: rowRect.isFirefox\n                ? WorkspaceMenuModel.safeFavicon(rowRect.modelData.tab.favicon) : ""\n              sourceSize.width: width * Screen.devicePixelRatio\n              sourceSize.height: height * Screen.devicePixelRatio\n              fillMode: Image.PreserveAspectFit\n              asynchronous: true\n              smooth: true\n              visible: status === Image.Ready\n            }' "$menu"
 assert_not_contains "fallback icon never uses a remote URL" \
   'https://icons' "$menu"
-assert_count "bare label, tab title, and tab URL each elide" \
-  3 'elide: Text.ElideRight' "$menu"
-assert_count "every browser-derived text path is forced plain" \
-  3 'textFormat: Text.PlainText' "$menu"
+assert_count "bare label, caption, tab title, and tab URL each elide" \
+  4 'elide: Text.ElideRight' "$menu"
+assert_count "every browser- or ledger-derived text path is forced plain" \
+  4 'textFormat: Text.PlainText' "$menu"
 assert_multiline "bare native label is forced plain before elision" \
-  $'            text: rowRect.isTmux\n              ? WorkspaceMenuModel.tmuxWindowLabel(rowRect.modelData.win.idx,\n                                                   rowRect.modelData.win.name,\n                                                   rowRect.modelData.win.state,\n                                                   rowRect.modelData.win.bell)\n              : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                + rowRect.modelData.cls\n                + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")\n            textFormat: Text.PlainText\n            color:' "$menu"
+  $'                  : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")\n                    + rowRect.modelData.cls\n                    + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")))\n            textFormat: Text.PlainText\n            color:' "$menu"
 assert_multiline "Firefox title is forced plain and remains first" \
   $'            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.title : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              font.family: Style.font.family\n              font.pixelSize: Style.font.body\n              font.bold: rowRect.isActiveFirefox\n              elide: Text.ElideRight\n              wrapMode: Text.NoWrap\n              renderType: Text.NativeRendering\n            }\n\n            Text {\n              width: parent.width\n              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText' "$menu"
 assert_multiline "Firefox display URL is forced plain before elision" \
   $'              text: rowRect.isFirefox ? rowRect.modelData.tab.displayUrl : ""\n              textFormat: Text.PlainText\n              color: Color.foreground\n              opacity: 0.55\n              font.family: card.ws.nerdFamily\n              font.pixelSize: Style.font.caption\n              elide: Text.ElideRight' "$menu"
 assert_multiline "tmux rows precede native expansion" \
-  $'      for (var i = 0; i < tmuxRows.length; i++)\n        out.push({kind: "tmux", win: tmuxRows[i]})\n\n      var bareRows = []' "$menu"
+  $'      for (var i = 0; i < merged.length; i++)\n        out.push({kind: "tmux", win: merged[i].win, row: merged[i]})\n      if (!card.targetWs) return out\n\n      var bareRows = []' "$menu"
 assert_multiline "native matches expand in place in native order" \
   $'      var expanded = []\n      for (var k = 0; k < bareRows.length; k++) {\n        var bare = bareRows[k]\n        var match = correlations[bare.key]\n        if (!match) {\n          expanded.push(bare)\n          continue\n        }\n        for (var tabIndex = 0; tabIndex < match.tabs.length; tabIndex++) {\n          expanded.push({\n            kind: "firefox-tab",\n            tab: match.tabs[tabIndex],\n            windowId: match.windowId,\n            top: bare.top\n          })\n        }\n      }\n\n      if (tmuxRows.length && expanded.length) out.push({kind: "div"})\n      return out.concat(expanded)' "$menu"
 assert_multiline "active Firefox fill persists without hover" \
@@ -380,6 +384,16 @@ MJS
 else
   printf 'skip - attention-mark behaviour (node not installed)\n'
 fi
+
+# --- ws-blackbox overlay contract ---------------------------------------------
+assert_contains "blackbox actions use the argv runner" \
+  'Util.execArgv([Quickshell.env("HOME") + "/.local/bin/ws-blackbox"]' "$workspaces"
+assert_not_contains "no shell-string blackbox commands" 'run("ws-blackbox' "$workspaces"
+assert_not_contains "no shell-string blackbox commands in menu" 'run("ws-blackbox' "$menu"
+assert_contains "tmux fetch never starts a server" '"tmux", "-N", "list-windows"' "$workspaces"
+assert_contains "ghosts suppressed when the live fetch is invalid" 'ws.tmuxLiveValid ? ws.ledger : null' "$menu"
+assert_contains "gone rows say so in words" '" gone"' "$menu"
+assert_contains "agent-gone rows say so in words" '" agent gone"' "$menu"
 
 if (( fails > 0 )); then
   printf '%d workspace-menu contract failure(s)\n' "$fails"

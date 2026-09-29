@@ -37,7 +37,8 @@ PopupCard {
 
   required property var ws       // the Workspaces widget root
   property var targetWs: null    // the HyprlandWorkspace this menu describes
-  readonly property int targetId: targetWs ? targetWs.id : -1
+  property var targetGhost: null // {name, id}: a workspace that exists only in the ws-blackbox ledger
+  readonly property int targetId: targetWs ? targetWs.id : (targetGhost ? targetGhost.id : -1)
 
   triggerMode: "click"
   contentWidth: fittedContentWidth(Math.max(Style.space(220), col.implicitWidth + padding * 2))
@@ -57,17 +58,42 @@ PopupCard {
   // both groups are present, then native toplevels with unique Firefox matches
   // expanded in place. The Hyprland side re-renders live; the tmux side moves
   // when the owner replaces the snapshot.
+  //
+  // ws-blackbox: tmux rows are the live windows MERGED with the recorder's ledger, so a
+  // window that disappeared keeps its place as a `gone` row. A ghost target (a workspace
+  // that exists only in the ledger) has no toplevels: tmux rows only, plus its actions.
+  function targetName() {
+    return card.targetWs ? ws.wsName(card.targetWs) : (card.targetGhost ? card.targetGhost.name : "")
+  }
+
   function rows() {
+    var out = card.coreRows()
+    try {
+      if (ws.menuLoading || (!card.targetWs && !card.targetGhost)) return out
+      var gone = 0
+      for (var i = 0; i < out.length; i++)
+        if (out[i].row && out[i].row.state === "gone") gone++
+      if (gone >= 2) out.push({kind: "dismiss-all", name: card.targetName()})
+      if (ws.recorder && ws.recorder.installed) out.push({kind: "recorder", text: ws.recorder.text})
+    } catch (error) {}
+    return out
+  }
+
+  function coreRows() {
     var out = []
     try {
-      if (!card.targetWs) return []
+      if (!card.targetWs && !card.targetGhost) return []
       if (ws.menuLoading) return []
 
-      var workspaceName = ws.wsName(card.targetWs)
+      var workspaceName = card.targetName()
       var tmuxRows = (workspaceName && ws.tmuxWindows[workspaceName])
         ? ws.tmuxWindows[workspaceName] : []
-      for (var i = 0; i < tmuxRows.length; i++)
-        out.push({kind: "tmux", win: tmuxRows[i]})
+      var merged = WorkspaceMenuModel.mergeWindows(tmuxRows, ws.tmuxLiveKeys,
+        ws.tmuxLiveValid ? ws.ledger : null, workspaceName, ws.bootId8)
+      if (card.targetGhost) out.push({kind: "ghost-actions", name: workspaceName})
+      for (var i = 0; i < merged.length; i++)
+        out.push({kind: "tmux", win: merged[i].win, row: merged[i]})
+      if (!card.targetWs) return out
 
       var bareRows = []
       var nativeWindows = []
@@ -171,10 +197,18 @@ PopupCard {
           readonly property bool isTmux: modelData.kind === "tmux"
           readonly property bool isFirefox: modelData.kind === "firefox-tab"
           readonly property bool isActiveFirefox: isFirefox && modelData.tab.active === true
+          readonly property string rowState: isTmux && modelData.row ? modelData.row.state : ""
+          readonly property bool isGone: rowState === "gone"
+          readonly property bool isAgentGone: rowState === "agent-gone"
+          readonly property string caption: isTmux && modelData.row ? modelData.row.caption : ""
+          readonly property bool isGhostActions: modelData.kind === "ghost-actions"
+          readonly property bool isDismissAll: modelData.kind === "dismiss-all"
+          readonly property bool isRecorder: modelData.kind === "recorder"
 
           width: col.width
           implicitHeight: isDiv ? Style.space(9)
-            : (isFirefox ? Style.space(42) : rowText.implicitHeight + Style.space(12))
+            : (isFirefox ? Style.space(42)
+              : rowText.implicitHeight + (captionText.visible ? captionText.implicitHeight : 0) + Style.space(12))
           radius: Style.space(4)
           color: !isDiv && rowArea.containsMouse
             ? Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.14)
@@ -192,24 +226,48 @@ PopupCard {
 
           Text {
             id: rowText
-            visible: !rowRect.isDiv && !rowRect.isFirefox
-            anchors.verticalCenter: parent.verticalCenter
+            visible: !rowRect.isDiv && !rowRect.isFirefox && !rowRect.isGhostActions
+            anchors.verticalCenter: captionText.visible ? undefined : parent.verticalCenter
+            anchors.top: captionText.visible ? parent.top : undefined
+            anchors.topMargin: Style.space(6)
             anchors.left: parent.left
             anchors.leftMargin: Style.space(8)
-            width: parent.width - Style.space(16)
+            width: parent.width - Style.space(16) - buttons.width
+            // State is carried by WORDS and opacity, never hue alone (the name keeps its colour).
             text: rowRect.isTmux
               ? WorkspaceMenuModel.tmuxWindowLabel(rowRect.modelData.win.idx,
                                                    rowRect.modelData.win.name,
                                                    rowRect.modelData.win.state,
                                                    rowRect.modelData.win.bell)
-              : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")
-                + rowRect.modelData.cls
-                + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")
+                + (rowRect.isGone ? " gone" : (rowRect.isAgentGone ? " agent gone" : ""))
+              : (rowRect.isDismissAll ? "dismiss all gone"
+                : (rowRect.isRecorder ? rowRect.modelData.text
+                  : (rowRect.modelData.top && rowRect.modelData.top.urgent === true ? card.ws.bellGlyph + " " : "")
+                    + rowRect.modelData.cls
+                    + (rowRect.modelData.title ? " · " + rowRect.modelData.title : "")))
             textFormat: Text.PlainText
             color: rowRect.isTmux ? card.nameFg(rowRect.modelData.win.name) : Color.foreground
-            opacity: rowRect.isTmux ? 1.0 : 0.85
+            opacity: rowRect.isGone ? 0.45 : (rowRect.isRecorder ? 0.5 : (rowRect.isTmux ? 1.0 : 0.85))
             font.family: card.ws.nerdFamily
             font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+            renderType: Text.NativeRendering
+          }
+
+          // What was running in the window, as of the recorder's last tick (read-only detail).
+          Text {
+            id: captionText
+            visible: rowRect.caption !== ""
+            anchors.top: rowText.bottom
+            anchors.left: rowText.left
+            anchors.leftMargin: Style.space(12)
+            width: rowText.width - Style.space(12)
+            text: rowRect.caption
+            textFormat: Text.PlainText
+            color: Color.foreground
+            opacity: rowRect.isGone ? 0.35 : 0.6
+            font.family: card.ws.nerdFamily
+            font.pixelSize: Style.font.caption
             elide: Text.ElideRight
             renderType: Text.NativeRendering
           }
@@ -286,10 +344,16 @@ PopupCard {
           MouseArea {
             id: rowArea
             enabled: !rowRect.isDiv && !card.ws.firefoxActivating
+              && !rowRect.isGone && !rowRect.isRecorder && !rowRect.isGhostActions
             anchors.fill: parent
+            anchors.rightMargin: buttons.width
             hoverEnabled: true
             cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: {
+              if (rowRect.isDismissAll) {
+                card.ws.blackbox(["dismiss", "--workspace", rowRect.modelData.name])
+                return
+              }
               if (rowRect.isTmux) {
                 card.ws.focusTmuxWindow(rowRect.modelData.win.session, rowRect.modelData.win.idx, card.targetId)
                 card.close()
@@ -304,11 +368,94 @@ PopupCard {
               card.close()
             }
           }
+
+          // Declared AFTER rowArea so these sit on top of it and get their own clicks.
+          // Ghost-workspace header: two full-height text buttons.
+          Row {
+            visible: rowRect.isGhostActions
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(8)
+            spacing: Style.space(16)
+            Repeater {
+              model: rowRect.isGhostActions
+                ? [{label: "Restore workspace", verb: "restore"}, {label: "Dismiss workspace", verb: "dismiss"}] : []
+              Item {
+                id: actionItem
+                required property var modelData
+                width: actionText.implicitWidth + Style.space(8)
+                height: parent.height
+                Text {
+                  id: actionText
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: actionItem.modelData.label
+                  color: Color.foreground
+                  font.family: card.ws.nerdFamily
+                  font.pixelSize: Style.font.body
+                  font.underline: actionArea.containsMouse
+                  renderType: Text.NativeRendering
+                }
+                MouseArea {
+                  id: actionArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    card.ws.blackbox([actionItem.modelData.verb, "--workspace", rowRect.modelData.name])
+                    card.close()
+                  }
+                }
+              }
+            }
+          }
+
+          // restore / dismiss: full-height hit targets on the right edge.
+          Row {
+            id: buttons
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: visible ? implicitWidth : 0
+            visible: rowRect.isGone || rowRect.isAgentGone
+            Repeater {
+              model: rowRect.isGone ? ["restore", "dismiss"] : (rowRect.isAgentGone ? ["restore"] : [])
+              Item {
+                id: btn
+                required property string modelData
+                width: Style.space(28)
+                height: buttons.height
+                Rectangle {
+                  anchors.fill: parent
+                  radius: Style.space(4)
+                  color: btnArea.containsMouse
+                    ? Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.2) : "transparent"
+                }
+                Text {
+                  anchors.centerIn: parent
+                  text: btn.modelData === "restore" ? "↺" : "✕"
+                  color: Color.foreground
+                  font.pixelSize: Style.font.body
+                  renderType: Text.NativeRendering
+                }
+                MouseArea {
+                  id: btnArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    var r = rowRect.modelData.row
+                    if (btn.modelData === "dismiss") card.ws.blackbox(["dismiss", r.key])
+                    else if (r.state === "agent-gone") card.ws.blackbox(["restore", "--pane", r.key, r.paneId])
+                    else card.ws.blackbox(["restore", r.key])
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
       Text {
-        visible: card.open && card.rows().length === 0
+        visible: card.open && card.rows().filter(function(r) { return r.kind !== "recorder" }).length === 0
         text: card.ws.menuLoading ? "loading..." : "no windows"
         color: Color.foreground
         opacity: 0.5
