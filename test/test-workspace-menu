@@ -92,10 +92,12 @@ assert_count "tabs argv token is declared exactly once" 1 \
   '"tabs"' "$workspaces"
 # This is a conservative source contract, not a semantic QML proof: every
 # current sink is counted and pinned so an added override fails closed.
-assert_regex_count "workspace has exactly seven semantic command sinks" 7 \
+assert_regex_count "workspace has exactly eight semantic command sinks" 8 \
   '(^|[^[:alnum:]_])(command[[:space:]]*:|[[:alnum:]_]+[[:space:]]*\.[[:space:]]*command[[:space:]]*=)' "$workspaces"
 assert_multiline "tmux window command is pinned to its Process" \
   $'  Process {\n    id: tmuxWinProc\n    command: ["tmux", "-N", "list-windows", "-a", "-F",\n      "#{session_name}\\u001f#{window_index}\\u001f#{window_name}\\u001f#{window_bell_flag}\\u001f#{window_id}\\u001f#{pid}\\u001f#{start_time}\\u001f#{P:#{pane_id}=#{pane_current_command};}\\u001f#{P:|#{@claude_state}}"]' "$workspaces"
+assert_multiline "hand command is pinned to its Process" \
+  $'  Process {\n    id: attnProc\n    command: ["tmux", "-N", "list-panes", "-a", "-F",\n      "#{session_name}\\u001f#{pane_current_command}\\u001f#{@claude_state}"]' "$workspaces"
 assert_multiline "boot id command is pinned to its Process (ws-blackbox key)" \
   $'  Process {\n    running: true\n    command: ["cat", "/proc/sys/kernel/random/boot_id"]' "$workspaces"
 assert_multiline "tmux client command is pinned to its Process" \
@@ -392,6 +394,8 @@ assert_contains "blackbox actions use the argv runner" \
 assert_not_contains "no shell-string blackbox commands" 'run("ws-blackbox' "$workspaces"
 assert_not_contains "no shell-string blackbox commands in menu" 'run("ws-blackbox' "$menu"
 assert_contains "tmux fetch never starts a server" '"tmux", "-N", "list-windows"' "$workspaces"
+assert_contains "hand fetch never starts a server" '"tmux", "-N", "list-panes"' "$workspaces"
+assert_contains "the hand's re-read runs only while something is blocked" 'running: root.blockedKey !== ""' "$workspaces"
 assert_contains "ghosts suppressed when the live fetch is invalid or the boot id is unread" '(ws.tmuxLiveValid && ws.bootId8) ? ws.ledger : null' "$menu"
 assert_not_contains "gone rows are dimmed, not suffixed" '" gone"' "$menu"
 assert_not_contains "the window title stays clean when only its agent exited" '" agent gone"' "$menu"
@@ -416,7 +420,7 @@ assert_contains "rows under a ghost workspace offer only dismiss (Restore worksp
   'model: rowRect.isGone ? (card.targetGhost ? ["dismiss"] : ["restore", "dismiss"])' "$menu"
 
 assert_contains "a pill knows its menu is open" 'readonly property bool menuOpen: wsMenu.open' "$workspaces"
-assert_contains "the open pill trades its middot for a caret (no width change)" 'WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false), entry.menuOpen)' "$workspaces"
+assert_contains "the open pill trades its middot for a caret (no width change)" 'WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false, entry.blocked), entry.menuOpen)' "$workspaces"
 assert_contains "the open pill is underlined" 'visible: entry.menuOpen' "$workspaces"
 
 assert_contains "captions are copied from modelData, never type-checked" 'WorkspaceMenuModel.stringList(modelData.row.caption)' "$menu"

@@ -63,11 +63,40 @@ function tmuxWindowLabel(idx, name, state, bell) {
   return markedLabel(idx, name, tmuxMark(state, bell))
 }
 
-// The bar pill deliberately exposes ONLY the bell, not the Claude states: a workspace
-// aggregates every window inside it, so ten Claudes would report ten statuses into one
-// slot. The pill answers "something in here rang"; the menu answers "what, exactly".
-function wsBarLabel(id, name, urgent) {
-  return markedLabel(id, name, urgent ? TMUX_GLYPH.bell : "")
+// The bar pill exposes only TWO marks, never the full Claude state: a workspace aggregates
+// every window inside it, so ten Claudes would report ten statuses into one slot. The bell
+// answers "something in here rang" and clears when you look (it is Hyprland's urgency).
+// The hand answers "a Claude in here is stalled on you" and clears only when it is answered
+// (2026-10-10, Chris) -- it is the one state worth a persistent slot, because it is the one
+// that cannot resolve without you. The hand outranks the bell: claude-attn rings the bell
+// on entering blocked, so the two usually coincide and the hand is the better reading.
+// The menu answers "what, exactly".
+function wsBarLabel(id, name, urgent, blocked) {
+  return markedLabel(id, name, blocked ? TMUX_GLYPH.blocked : (urgent ? TMUX_GLYPH.bell : ""))
+}
+
+// Sessions holding a Claude stalled on the user, from
+// `tmux -N list-panes -a -F '#{session_name}\x1f#{pane_current_command}\x1f#{@claude_state}'`.
+// The pill maps a workspace to its session BY NAME, the same as the window menu does.
+//
+// A pane back at a shell prompt does not count, whatever its option says: a Claude that
+// died without firing SessionEnd leaves a stale `blocked` behind, and a hand that never
+// clears would teach Chris to ignore the hand. Guarding on "not a shell" rather than
+// "is claude" fails toward showing the hand if Claude's process name ever changes.
+//
+// valid:false means "no information" (the caller keeps what it had, so a tmux hiccup
+// cannot drop a real hand); "no server running" is a valid, empty world.
+function blockedSessions(exitCode, out, err) {
+  var sessions = Object.create(null)
+  if (exitCode !== 0) return {sessions: sessions, valid: isNoServer(err)}
+  var lines = String(out || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var p = lines[i].split("\u001f")
+    if (p.length < 3 || p[0] === "") continue
+    if (p[2] !== "blocked" || LEDGER_SHELLS[p[1]] === true) continue
+    sessions[p[0]] = true
+  }
+  return {sessions: sessions, valid: true}
 }
 
 // Frozen colorhash contract: FNV1a32(UTF8(NFC(name))).

@@ -50,11 +50,69 @@ TestCase {
     compare(Model.tmuxWindowLabel(2, "", "", false), "2")
   }
 
-  function test_ws_bar_label_exposes_only_the_bell() {
+  function test_ws_bar_label_exposes_only_the_bell_and_the_hand() {
     compare(Model.wsBarLabel(2, "mirepoix", true), "2" + middot + glyphBell + " mirepoix")
     compare(Model.wsBarLabel(2, "mirepoix", false), "2" + middot + "mirepoix")
     compare(Model.wsBarLabel(5, "", true), "5" + middot + glyphBell)
     compare(Model.wsBarLabel(5, "", false), "5")
+    compare(Model.wsBarLabel(2, "mirepoix", false, true), "2" + middot + glyphBlocked + " mirepoix")
+    compare(Model.wsBarLabel(5, "", false, true), "5" + middot + glyphBlocked)
+  }
+
+  function test_ws_bar_label_hand_outranks_the_bell() {
+    compare(Model.wsBarLabel(2, "mirepoix", true, true), "2" + middot + glyphBlocked + " mirepoix")
+  }
+
+  // `tmux list-panes -a -F '#{session_name}\x1f#{pane_current_command}\x1f#{@claude_state}'`
+  function test_blocked_sessions_collects_sessions_with_a_blocked_claude() {
+    var r = Model.blockedSessions(0,
+      "mirepoix\u001fclaude\u001fblocked\n" +
+      "mirepoix\u001fclaude\u001fbusy\n" +
+      "oracle\u001fclaude\u001fidle\n" +
+      "notes\u001fbash\u001f\n")
+    compare(r.valid, true)
+    compare(Object.keys(r.sessions), ["mirepoix"])
+    compare(r.sessions.mirepoix, true)
+  }
+
+  function test_blocked_sessions_ignores_a_stale_blocked_on_a_shell_prompt() {
+    // A Claude that died without SessionEnd leaves `blocked` on a pane that is back at a shell.
+    var r = Model.blockedSessions(0,
+      "a\u001fbash\u001fblocked\n" +
+      "b\u001fzsh\u001fblocked\n" +
+      "c\u001ffish\u001fblocked\n" +
+      "d\u001fsh\u001fblocked\n" +
+      "e\u001fdash\u001fblocked\n")
+    compare(r.valid, true)
+    compare(Object.keys(r.sessions).length, 0)
+  }
+
+  function test_blocked_sessions_matches_the_state_exactly() {
+    var r = Model.blockedSessions(0, "a\u001fclaude\u001fblockedish\nb\u001fclaude\u001funblocked\n")
+    compare(Object.keys(r.sessions).length, 0)
+  }
+
+  function test_blocked_sessions_no_server_is_an_empty_valid_world() {
+    var r = Model.blockedSessions(1, "", "no server running on /tmp/tmux-1000/default\n")
+    compare(r.valid, true)
+    compare(Object.keys(r.sessions).length, 0)
+  }
+
+  function test_blocked_sessions_other_failures_are_invalid() {
+    compare(Model.blockedSessions(1, "", "some other error").valid, false)
+  }
+
+  function test_blocked_sessions_survive_prototype_sensitive_names() {
+    var r = Model.blockedSessions(0, "constructor\u001fclaude\u001fblocked\n__proto__\u001fclaude\u001fblocked\n")
+    compare(r.sessions["constructor"], true)
+    compare(r.sessions["__proto__"], true)
+    compare(Model.blockedSessions(0, "").sessions["constructor"], undefined)
+  }
+
+  function test_blocked_sessions_skips_malformed_rows() {
+    var r = Model.blockedSessions(0, "\nonly-one-field\nx\u001fclaude\n")
+    compare(r.valid, true)
+    compare(Object.keys(r.sessions).length, 0)
   }
 
   function test_colorhash_matches_bash_nfc_contract() {

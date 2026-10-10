@@ -14,6 +14,10 @@ Three parts, all in this repo:
 - **a bar widget** (`Workspaces.qml` and friends) — the host capsule doubles as
   the Omarchy menu button, then one entry per workspace as `id·name`, the
   focused one a filled pill in its colorhash colour, urgent ones with a bell.
+  A workspace whose tmux session holds a Claude Code session stalled on a
+  prompt shows a hand instead, and keeps it until the prompt is answered
+  (read from a `@claude_state` pane option that a Claude Code hook writes;
+  without one, nothing changes).
   Right-click a workspace for its window menu; SUPER+ALT+N opens a rename
   dialog with a live preview of the pill you are about to get.
 - **`bin/`** — the scripts the widget, the keybinds, and tmux hooks call.

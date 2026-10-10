@@ -40,6 +40,12 @@ import "WorkspaceMenuModel.js" as WorkspaceMenuModel
 // ledger only ever won the race by one event and was deleted. An urgent entry wedges a
 // bell after the id.
 //
+// THE HAND IS THE ONE PERSISTENT MARK (2026-10-10). A workspace whose tmux session holds a
+// Claude stalled on you (@claude_state == blocked, from ~/oracle/scripts/claude-attn) shows
+// U+F256 in the bell's slot, outranking it, and keeps it -- focused or not -- until the
+// prompt is answered. The bell clears when you look; a stalled Claude does not un-stall
+// because you looked. Mechanism and its zero-cost-at-rest shape: "the persistent hand" below.
+//
 // THE BELL ASSERTS NO COLOUR OF ITS OWN. An urgent entry keeps the colour of its NAME --
 // attention is the glyph, identity is the colour, and the two channels stay separate.
 // This entry used to repaint to the theme's urgent colour on a bell, which read as the
@@ -71,7 +77,8 @@ import "WorkspaceMenuModel.js" as WorkspaceMenuModel
 // previews; `ws-rename --apply` decides. If the shell is down, ws-rename
 // falls back to the plain omarchy-menu-input prompt.
 //
-// Glyphs: U+E900 Omarchy mark (the shell's own "omarchy" font), U+F0F3 bell, U+00B7 middot.
+// Glyphs: U+E900 Omarchy mark (the shell's own "omarchy" font), U+F0F3 bell, U+F256 hand,
+// U+00B7 middot.
 BarWidget {
   id: root
   moduleName: "omarchy.workspaces"
@@ -211,8 +218,8 @@ BarWidget {
   // ten statuses into one slot. The pill answers "something in here rang"; the menu
   // answers "what, exactly". Placement matches the tmux bar as of 2026-09-16: after the
   // middot, one space before the name.
-  function wsLabel(w, urgent) {
-    return WorkspaceMenuModel.wsBarLabel(w.id, root.wsName(w), urgent)
+  function wsLabel(w, urgent, blocked) {
+    return WorkspaceMenuModel.wsBarLabel(w.id, root.wsName(w), urgent, blocked)
   }
   function wsKey(w) { var nm = root.wsName(w); return nm ? nm : String(w.id) }
 
@@ -532,6 +539,89 @@ BarWidget {
     }
   }
 
+  // --- the persistent hand ----------------------------------------------------
+  // blockedSessions: session name -> true for every tmux session holding a Claude stalled
+  // on Chris (WorkspaceMenuModel.blockedSessions has the rules). A pill shows the hand when
+  // its workspace name is in the set -- the same by-name mapping the window menu uses.
+  //
+  // NOTHING RUNS AT REST. claude-attn rings a bell on the transition INTO blocked, which
+  // reaches here as a bell>>/urgent>> raw event: that is the cue to read tmux. A workspace
+  // switch reads it again, which catches a block that rang in the window you were already
+  // on (a focused terminal raises no urgency). Leaving blocked rings nothing -- Chris
+  // answered, at the desk or from the phone -- so while the set is non-empty a 3 s timer
+  // re-reads tmux until it empties, then stops. Overlapping cues coalesce into one rerun.
+  property var blockedSessions: Object.create(null)
+  property string blockedKey: ""
+  property bool attnAgain: false
+  property string attnOut: ""
+  property string attnErr: ""
+  property int attnExitCode: -1
+  property bool attnOutReady: false
+  property bool attnErrReady: false
+  property bool attnExitReady: false
+
+  Process {
+    id: attnProc
+    command: ["tmux", "-N", "list-panes", "-a", "-F",
+      "#{session_name}\u001f#{pane_current_command}\u001f#{@claude_state}"]
+    stdout: StdioCollector {
+      onStreamFinished: { root.attnOut = String(text); root.attnOutReady = true; root.finishAttention() }
+    }
+    stderr: StdioCollector {
+      onStreamFinished: { root.attnErr = String(text); root.attnErrReady = true; root.finishAttention() }
+    }
+    // qmllint disable signal-handler-parameters
+    onExited: function(exitCode) {
+      root.attnExitCode = exitCode
+      root.attnExitReady = true
+      root.finishAttention()
+    }
+    // qmllint enable signal-handler-parameters
+  }
+
+  function refreshAttention() {
+    if (attnProc.running) { root.attnAgain = true; return }
+    root.attnOutReady = false
+    root.attnErrReady = false
+    root.attnExitReady = false
+    attnProc.running = true
+  }
+
+  // Reassign only when the SET changes, so a 3 s tick with nothing new repaints no pill.
+  // An invalid read (tmux hiccup) keeps the old set: dropping a real hand is the worse error.
+  function finishAttention() {
+    if (!root.attnOutReady || !root.attnErrReady || !root.attnExitReady) return
+    var r = WorkspaceMenuModel.blockedSessions(root.attnExitCode, root.attnOut, root.attnErr)
+    if (r.valid) {
+      var key = Object.keys(r.sessions).sort().join("\u001f")
+      if (key !== root.blockedKey) { root.blockedSessions = r.sessions; root.blockedKey = key }
+    }
+    if (root.attnAgain) { root.attnAgain = false; Qt.callLater(root.refreshAttention) }
+  }
+
+  function isBlocked(w) {
+    var nm = w ? root.wsName(w) : ""
+    return nm !== "" && root.blockedSessions[nm] === true
+  }
+
+  Timer {
+    interval: 3000
+    repeat: true
+    running: root.blockedKey !== ""
+    onTriggered: root.refreshAttention()
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      var n = event.name
+      if (n === "bell" || n === "urgent" || n === "workspacev2" || n === "focusedmon")
+        root.refreshAttention()
+    }
+  }
+
+  Component.onCompleted: root.refreshAttention()
+
   // Keep the snapshot honest WHILE the menu is showing: a bell that rings with
   // it open re-fetches the tmux half, so window_bell_flag/@claude_state marks appear live
   // instead of on the next open. Gated on the menu -- closed, zero listeners
@@ -742,6 +832,8 @@ BarWidget {
         readonly property var ws: ghost ? null : modelData.ws
         readonly property bool focused: !ghost && ws.focused
         readonly property bool urgent: !ghost && ws.urgent
+        // blockedKey first: a cheap short-circuit while nothing is blocked (the usual case).
+        readonly property bool blocked: !ghost && root.blockedKey !== "" && root.isBlocked(ws)
         readonly property string key: ghost ? modelData.name : root.wsKey(ws)
         // The pill whose window menu is open trades its middot for a caret (same cell width,
         // nothing shifts) and gets an underline, so the card reads as its own -- shape, not hue.
@@ -750,7 +842,7 @@ BarWidget {
           : wsMenu.targetWs === ws)
         readonly property string flatLabel: WorkspaceMenuModel.openLabel(ghost
           ? WorkspaceMenuModel.wsBarLabel(modelData.id, modelData.name, false)
-          : root.wsLabel(ws, urgent), menuOpen)
+          : root.wsLabel(ws, urgent, blocked), menuOpen)
 
         width: focused ? pill.implicitWidth : flat.implicitWidth
         height: root.barSize
@@ -759,7 +851,9 @@ BarWidget {
           id: pill
           anchors.verticalCenter: parent.verticalCenter
           visible: entry.focused
-          label: entry.ghost ? "" : WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false), entry.menuOpen)
+          // The focused pill never shows the bell (Hyprland clears urgency on focus), but it does
+          // show the hand: a stalled Claude stays stalled while you look at its workspace.
+          label: entry.ghost ? "" : WorkspaceMenuModel.openLabel(root.wsLabel(entry.ws, false, entry.blocked), entry.menuOpen)
           color: root.fillFor(entry.key)
           textColor: root.fillTextFor(entry.key)
         }
