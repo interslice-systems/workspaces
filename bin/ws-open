@@ -197,10 +197,33 @@ recheck="$(read_toplevel)" || fallback fallback-window-query
 [[ $recheck == "$toplevel" ]] || fallback fallback-window-changed
 
 command -v omarchy-firefox-bridge >/dev/null 2>&1 || fallback fallback-bridge-unavailable
-if ! bridge_result="$(omarchy-firefox-bridge open \
-  --toplevel-title "$title" --url "$url" "${group_args[@]}" 2>/dev/null)"; then
-  # Parse only the known enum. Never pass raw stdout/stderr to the logger.
-  bridge_error="$(jq -er '.error | strings' <<<"$bridge_result" 2>/dev/null)" || bridge_error=bridge-error
+bridge_open() {
+  bridge_result="$(omarchy-firefox-bridge open \
+    --toplevel-title "$1" --url "$url" "${group_args[@]}" 2>/dev/null)"
+}
+# Parse only the known enum. Never pass raw stdout/stderr to the logger.
+bridge_error() { jq -er '.error | strings' <<<"$bridge_result" 2>/dev/null || echo bridge-error; }
+
+# Once a second Firefox profile exists, every window title carries the
+# profile's name — "<tab> — <profile> — Mozilla Firefox" — but the broker
+# correlates on "<active tab title> — Mozilla Firefox" alone. One stray
+# profile (2026-09-30) silently ended routing this way. So after a no-window
+# answer, and only then, ask once more without the last segment. Exact first,
+# so a tab title that itself contains " — " is trimmed only when its exact
+# title already missed; and no-window created nothing, so the retry cannot
+# duplicate a tab the way a retried timeout could.
+opened=0
+bridge_open "$title" && opened=1
+if (( !opened )) && [[ $(bridge_error) == no-window ]]; then
+  base="${title% — Mozilla Firefox}"
+  stripped="${base% — *}"
+  if [[ $base != "$title" && $stripped != "$base" ]]; then
+    ws_browser_log route-title-retry
+    bridge_open "$stripped — Mozilla Firefox" && opened=1
+  fi
+fi
+if (( !opened )); then
+  bridge_error="$(bridge_error)"
   case "$bridge_error" in
     unavailable|timeout|no-window|ambiguous-window|invalid-request|create-failed)
       fallback "fallback-bridge-$bridge_error" ;;

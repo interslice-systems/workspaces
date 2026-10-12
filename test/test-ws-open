@@ -90,6 +90,12 @@ STUB
 cat > "$TMPD/bin/omarchy-firefox-bridge" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$BRIDGE_LOG"
+# STUB_BRIDGE_MATCH models the broker's exact title correlation: any other
+# --toplevel-title answers no-window, as the real broker does.
+if [[ -n ${STUB_BRIDGE_MATCH:-} && ${3:-} != "$STUB_BRIDGE_MATCH" ]]; then
+  printf '{"ok":false,"error":"no-window"}'
+  exit 3
+fi
 printf '%s' "${STUB_BRIDGE_RESULT:-}"
 printf '%s' "${STUB_BRIDGE_STDERR:-}" >&2
 exit "${STUB_BRIDGE_EXIT:-0}"
@@ -338,6 +344,38 @@ STUB_LOCAL="[{\"session\":\"$LONG_NAME\",\"address\":\"0xaa\",\"pid\":$$,\"works
   run https://e.com/x >/dev/null
 assert_eq "a session name over 64 code points still routes, ungrouped" \
   "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x" \
+  "$(bridged)"
+
+# --- Firefox profile name in the window title -------------------------------
+# Once a second Firefox profile exists, every title gains the profile's name:
+# "<tab> — <profile> — Mozilla Firefox". The broker correlates on
+# "<active tab title> — Mozilla Firefox" only, so ws-open asks again without
+# the profile segment after a no-window answer — and only then.
+PROFILE_FF='[{"address":"0xaa","class":"firefox","title":"Alpha — Original profile — Mozilla Firefox","workspace":{"id":2,"name":"oracle"}}]'
+STUB_CLIENTS="$PROFILE_FF" STUB_BRIDGE_MATCH='Alpha — Mozilla Firefox' \
+  run https://e.com/x >/dev/null
+assert_eq "a profile-suffixed title is retried without the profile segment" \
+  "open --toplevel-title Alpha — Original profile — Mozilla Firefox --url https://e.com/x --group oracleopen --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+assert_eq "... and routes rather than falling through" "" "$(launched)"
+assert_eq "... with a retry diagnostic" \
+  route-origin-window,group-color-unavailable,route-title-retry,route-opened-group-requested "$(events)"
+
+STUB_CLIENTS="$PROFILE_FF" STUB_BRIDGE_MATCH='no such window' \
+  run https://e.com/x >/dev/null
+assert_eq "a retry that also misses falls through to Firefox" "https://e.com/x" "$(launched)"
+assert_eq "... reporting the retry's own failure" \
+  route-origin-window,group-color-unavailable,route-title-retry,fallback-bridge-no-window "$(events)"
+
+STUB_CLIENTS="$PROFILE_FF" STUB_BRIDGE_EXIT=3 STUB_BRIDGE_RESULT='{"ok":false,"error":"timeout"}' \
+  run https://e.com/x >/dev/null
+assert_eq "only no-window is retried (a timeout may still create the tab)" \
+  "open --toplevel-title Alpha — Original profile — Mozilla Firefox --url https://e.com/x --group oracle" \
+  "$(bridged)"
+
+STUB_BRIDGE_MATCH='no such window' run https://e.com/x >/dev/null
+assert_eq "a title with no segment to strip is not retried" \
+  "open --toplevel-title Alpha — Mozilla Firefox --url https://e.com/x --group oracle" \
   "$(bridged)"
 
 # --- browser adapter and Omarchy launcher integration -----------------------

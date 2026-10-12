@@ -4,7 +4,7 @@
 ws_browser_log() {
   case "${1:-}" in
     adapter-normal-launch|adapter-private-launch|adapter-new-window|adapter-route|adapter-invalid-invocation|exec-failed|\
-    route-invalid-url|route-origin-pane|route-origin-window|route-new-window|route-opened-group-requested|route-opened-ungrouped|\
+    route-invalid-url|route-origin-pane|route-origin-window|route-new-window|route-opened-group-requested|route-opened-ungrouped|route-title-retry|\
     group-name-too-long|group-color-unavailable|\
     fallback-missing-hyprctl|fallback-missing-jq|fallback-missing-tmux|fallback-tmux-session|fallback-local-clients|fallback-local-workspace|fallback-no-session|\
     fallback-client-activity|fallback-remote-client|fallback-active-workspace|fallback-workspace-lookup|fallback-special-workspace|\
